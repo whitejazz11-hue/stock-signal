@@ -1,0 +1,39 @@
+name: 毎日の株式シグナル通知
+
+on:
+  schedule:
+    # 毎日 16:00 JST（= 07:00 UTC）に実行
+    # 日本市場クローズ（15:30）の30分後
+    - cron: '0 7 * * 1-5'  # 月〜金のみ
+
+  # 手動実行ボタンも有効にする
+  workflow_dispatch:
+
+jobs:
+  send-signal:
+    runs-on: ubuntu-latest
+
+    steps:
+      # リポジトリをチェックアウト
+      - name: コードを取得
+        uses: actions/checkout@v4
+
+      # Pythonセットアップ
+      - name: Python 3.11 をセットアップ
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # 依存ライブラリをインストール
+      - name: ライブラリをインストール
+        run: |
+          pip install yfinance pandas numpy
+
+      # シグナル計算・メール送信
+      - name: シグナル通知を実行
+        env:
+          GMAIL_USER:        ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL:      ${{ secrets.NOTIFY_EMAIL }}
+        run: |
+          python signal_system.py
