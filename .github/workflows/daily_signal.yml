@@ -2,7 +2,7 @@ name: 毎日の株式シグナル通知
 
 on:
   schedule:
-    # 毎日 16:00 JST（= 07:00 UTC）に実行
+    # 毎日 16:00 JST (= 07:00 UTC) に実行
     # 日本市場クローズ（15:30）の30分後
     - cron: '0 7 * * 1-5'  # 月〜金のみ
 
@@ -32,10 +32,10 @@ jobs:
       # シグナル計算・メール送信
       - name: シグナル通知を実行
         env:
-          GMAIL_USER:        ${{ secrets.GMAIL_USER }}
-          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
-          NOTIFY_EMAIL:      ${{ secrets.NOTIFY_EMAIL }}
-                    GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
-                              SHEETS_ID:                 ${{ secrets.SHEETS_ID }}
+          GMAIL_USER:                  ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD:          ${{ secrets.GMAIL_APP_PASSWORD }}
+          NOTIFY_EMAIL:                ${{ secrets.NOTIFY_EMAIL }}
+          GOOGLE_SHEETS_CREDENTIALS:   ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          SHEETS_ID:                   ${{ secrets.SHEETS_ID }}
         run: |
           python signal_system.py
