@@ -6,7 +6,7 @@ GitHub Actions で動かすスクリプト
 """
 
 import os
-import smtplib
+import smtpli
 import warnings
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
@@ -89,7 +89,7 @@ def fetch_data():
     """株価・出来高データを取得"""
     tickers = [f"{c}.T" for c in STOCKS]
     start   = (datetime.today() - timedelta(days=180)).strftime("%Y-%m-%d")
-    today   = datetime.today().strftime("%Y-%m-%d")
+    today   (datetime.today() + timedelta(days=1)).strftime("%Y-%m-%d")
 
     raw = yf.download(tickers, start=start, end=today,
                       interval="1d", auto_adjust=True, progress=False)
