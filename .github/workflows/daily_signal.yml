@@ -27,7 +27,7 @@ jobs:
       # 依存ライブラリをインストール
       - name: ライブラリをインストール
         run: |
-          pip install yfinance pandas numpy
+          pip install yfinance pandas numpy gspread google-auth
 
       # シグナル計算・メール送信
       - name: シグナル通知を実行
