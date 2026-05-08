@@ -6,7 +6,7 @@ GitHub Actions で動かすスクリプト
 """
 
 import os
-import smtpli
+import smtplib
 import warnings
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
