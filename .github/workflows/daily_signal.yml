@@ -21,7 +21,7 @@ jobs:
 
       - name: ライブラリをインストール
         run: |
-          pip install yfinance pandas numpy gspread google-auth
+          pip install yfinance pandas numpy gspread google-auth requests openpyxl
 
       - name: シグナル通知を実行
         env:
