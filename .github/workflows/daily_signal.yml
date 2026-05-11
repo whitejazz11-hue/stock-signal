@@ -31,4 +31,5 @@ jobs:
           GOOGLE_SHEETS_CREDENTIALS:  ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           SHEETS_ID:                  ${{ secrets.SHEETS_ID }}
         run: |
-          python signal_system.py
+          pip install requests pandas
+          python check_margin.py
