@@ -69,6 +69,8 @@ STOCKS = {
 # ============================================================
 
 def get_sheets_client():
+    raw = os.environ.get("GOOGLE_SHEETS_CREDENTIALS", "NOT_SET")   # ← この1行を追加
+    print(f"CREDS: 先頭50文字={raw[:50]} / 長さ={len(raw)}")       # ← この1行を追加
     creds_dict = json.loads(os.environ["GOOGLE_SHEETS_CREDENTIALS"])
     scopes = [
         "https://spreadsheets.google.com/feeds",
@@ -76,7 +78,6 @@ def get_sheets_client():
     ]
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     return gspread.authorize(creds)
-
 
 def get_or_create_sheet(spreadsheet, sheet_name, headers=None):
     try:
