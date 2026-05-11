@@ -1,8 +1,10 @@
 """
-信用倍率 分布確認スクリプト（デバッグ版）
+信用倍率 分布確認スクリプト（softhompo版）
+データソース: softhompo.a.la9.jp (JPX銘柄別信用取引週末残高)
 """
 
 import io
+import zipfile
 import requests
 import pandas as pd
 from datetime import datetime, timedelta
@@ -11,88 +13,148 @@ from zoneinfo import ZoneInfo
 JST = ZoneInfo("Asia/Tokyo")
 
 
-def fetch_margin_ratios():
+def fetch_margin_ratios() -> pd.DataFrame:
     today = datetime.now(JST).date()
-    print(f"本日: {today} (weekday={today.weekday()})")
+    print(f"本日: {today}")
 
+    # 直近8週のFridayを試みる（thisMonth → pastMonth の順）
     for weeks_back in range(8):
         days_back = (today.weekday() - 4) % 7 + weeks_back * 7
         target    = today - timedelta(days=days_back)
         date_str  = target.strftime("%Y%m%d")
-        url = (
-            "https://www.jpx.co.jp/markets/statistics-equities"
-            f"/margin/nlsgeu000000xbna-att/data_{date_str}.csv"
-        )
+        ym_str    = target.strftime("%Y%m")
 
+        # まず当月ファイルを試す
+        url = f"https://softhompo.a.la9.jp/Data/margin/thisMonth/syumatsu{date_str}00.zip"
         print(f"\n試行: {date_str} → {url}")
 
-        try:
-            resp = requests.get(url, timeout=30)
-            print(f"  ステータス: {resp.status_code}")
-            print(f"  Content-Type: {resp.headers.get('Content-Type', '不明')}")
-            print(f"  サイズ: {len(resp.content)} bytes")
+        df = try_download_zip(url, date_str)
+        if df is not None:
+            return df
 
-            if resp.status_code != 200:
-                print("  → スキップ（200以外）")
-                continue
-
-            try:
-                df = pd.read_csv(
-                    io.BytesIO(resp.content),
-                    encoding="shift_jis",
-                    skiprows=1,
-                )
-                print(f"  カラム: {list(df.columns)}")
-                print(f"  行数: {len(df)}")
-
-                code_cols  = [c for c in df.columns if "コード" in str(c)]
-                ratio_cols = [c for c in df.columns if "倍率" in str(c)]
-                print(f"  コード列: {code_cols}")
-                print(f"  倍率列: {ratio_cols}")
-
-                if not code_cols or not ratio_cols:
-                    print("  → カラムが見つからずスキップ")
-                    continue
-
-                df = df[[code_cols[0], ratio_cols[0]]].copy()
-                df.columns = ["コード", "信用倍率"]
-                df["信用倍率"] = pd.to_numeric(df["信用倍率"], errors="coerce")
-                df = df.dropna(subset=["信用倍率"])
-                df = df[df["信用倍率"] > 0]
-
-                print(f"\n✅ 取得成功: {len(df)}銘柄 (基準日: {date_str})")
+        # 次に過去月ファイルを試す（月が変わった場合）
+        past_url = f"https://softhompo.a.la9.jp/Data/margin/pastMonth/{ym_str}.zip"
+        if past_url != url:
+            print(f"  過去月ファイルを試行: {past_url}")
+            df = try_download_pastmonth_zip(past_url, date_str)
+            if df is not None:
                 return df
-
-            except Exception as e:
-                print(f"  CSV読み込みエラー: {e}")
-                try:
-                    df = pd.read_csv(
-                        io.BytesIO(resp.content),
-                        encoding="utf-8",
-                        skiprows=1,
-                    )
-                    print(f"  UTF-8で再試行 → カラム: {list(df.columns)}")
-                except Exception as e2:
-                    print(f"  UTF-8も失敗: {e2}")
-                continue
-
-        except Exception as e:
-            print(f"  接続エラー: {e}")
-            continue
 
     return pd.DataFrame()
 
 
+def try_download_zip(url: str, date_str: str) -> pd.DataFrame | None:
+    try:
+        resp = requests.get(url, timeout=30)
+        print(f"  ステータス: {resp.status_code} / サイズ: {len(resp.content)} bytes")
+
+        if resp.status_code != 200:
+            return None
+
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+            names = z.namelist()
+            print(f"  ZIP内ファイル: {names}")
+
+            csv_files = [f for f in names if f.lower().endswith('.csv')]
+            if not csv_files:
+                print("  CSVファイルなし")
+                return None
+
+            with z.open(csv_files[0]) as f:
+                return parse_margin_csv(f.read(), date_str)
+
+    except Exception as e:
+        print(f"  エラー: {e}")
+        return None
+
+
+def try_download_pastmonth_zip(url: str, target_date: str) -> pd.DataFrame | None:
+    try:
+        resp = requests.get(url, timeout=30)
+        if resp.status_code != 200:
+            return None
+
+        with zipfile.ZipFile(io.BytesIO(resp.content)) as z:
+            # 対象日付に一致するファイルを探す
+            target_files = [f for f in z.namelist() if target_date in f]
+            if not target_files:
+                return None
+
+            with z.open(target_files[0]) as f:
+                return parse_margin_csv(f.read(), target_date)
+
+    except Exception as e:
+        print(f"  過去月エラー: {e}")
+        return None
+
+
+def parse_margin_csv(raw_bytes: bytes, date_str: str) -> pd.DataFrame | None:
+    """JPX形式の信用取引CSVを読み込み、コード→倍率のDataFrameを返す"""
+    for encoding in ["shift_jis", "utf-8", "cp932"]:
+        for skiprows in [0, 1, 2]:
+            try:
+                df = pd.read_csv(
+                    io.BytesIO(raw_bytes),
+                    encoding=encoding,
+                    skiprows=skiprows,
+                    header=0,
+                )
+                print(f"  エンコード:{encoding} skiprows:{skiprows} → カラム: {list(df.columns)[:6]}")
+
+                # コード列と倍率列を特定
+                code_cols  = [c for c in df.columns if "コード" in str(c)]
+                ratio_cols = [c for c in df.columns if "倍率" in str(c)]
+
+                # 倍率列がない場合は信用買残÷信用売残で計算
+                buy_cols   = [c for c in df.columns if "買残" in str(c) and "前週" not in str(c)]
+                sell_cols  = [c for c in df.columns if "売残" in str(c) and "前週" not in str(c)]
+
+                print(f"    コード列:{code_cols} / 倍率列:{ratio_cols} / 買残:{buy_cols} / 売残:{sell_cols}")
+
+                if not code_cols:
+                    continue
+
+                code_col = code_cols[0]
+
+                if ratio_cols:
+                    ratio_col = ratio_cols[0]
+                    df_out = df[[code_col, ratio_col]].copy()
+                    df_out.columns = ["コード", "信用倍率"]
+                elif buy_cols and sell_cols:
+                    df_out = df[[code_col, buy_cols[0], sell_cols[0]]].copy()
+                    df_out.columns = ["コード", "信用買残", "信用売残"]
+                    df_out["信用倍率"] = pd.to_numeric(df_out["信用買残"], errors="coerce") / \
+                                         pd.to_numeric(df_out["信用売残"], errors="coerce")
+                else:
+                    continue
+
+                df_out["コード"] = df_out["コード"].apply(
+                    lambda x: str(int(x)).zfill(4) if pd.notna(x) and str(x).strip().replace('.','').isdigit() else None
+                )
+                df_out = df_out.dropna(subset=["コード"])
+                df_out["信用倍率"] = pd.to_numeric(df_out["信用倍率"], errors="coerce")
+                df_out = df_out[df_out["信用倍率"] > 0]
+
+                if len(df_out) > 10:
+                    print(f"\n✅ 取得成功: {len(df_out)}銘柄 (基準日: {date_str})")
+                    return df_out[["コード", "信用倍率"]]
+
+            except Exception as e:
+                continue
+
+    print("  → 全エンコード・全skiprows試行失敗")
+    return None
+
+
 def main():
     print("=" * 50)
-    print("信用倍率データ取得テスト")
+    print("信用倍率データ取得テスト（softhompo版）")
     print("=" * 50)
 
     df = fetch_margin_ratios()
 
     if df.empty:
         print("\n❌ 全ての試行が失敗しました")
-        print("→ JPXのURL形式が変更された可能性があります")
         return
 
     total  = len(df)
