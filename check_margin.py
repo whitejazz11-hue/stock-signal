@@ -1,7 +1,5 @@
 """
-信用倍率 分布確認スクリプト
-実行方法: python check_margin.py
-出力: 倍率ごとの銘柄数・除外率の一覧
+信用倍率 分布確認スクリプト（デバッグ版）
 """
 
 import io
@@ -13,10 +11,11 @@ from zoneinfo import ZoneInfo
 JST = ZoneInfo("Asia/Tokyo")
 
 
-def fetch_margin_ratios() -> pd.DataFrame:
+def fetch_margin_ratios():
     today = datetime.now(JST).date()
+    print(f"本日: {today} (weekday={today.weekday()})")
 
-    for weeks_back in range(4):
+    for weeks_back in range(8):
         days_back = (today.weekday() - 4) % 7 + weeks_back * 7
         target    = today - timedelta(days=days_back)
         date_str  = target.strftime("%Y%m%d")
@@ -25,47 +24,78 @@ def fetch_margin_ratios() -> pd.DataFrame:
             f"/margin/nlsgeu000000xbna-att/data_{date_str}.csv"
         )
 
+        print(f"\n試行: {date_str} → {url}")
+
         try:
             resp = requests.get(url, timeout=30)
+            print(f"  ステータス: {resp.status_code}")
+            print(f"  Content-Type: {resp.headers.get('Content-Type', '不明')}")
+            print(f"  サイズ: {len(resp.content)} bytes")
+
             if resp.status_code != 200:
+                print("  → スキップ（200以外）")
                 continue
 
-            df = pd.read_csv(
-                io.BytesIO(resp.content),
-                encoding="shift_jis",
-                skiprows=1,
-            )
+            try:
+                df = pd.read_csv(
+                    io.BytesIO(resp.content),
+                    encoding="shift_jis",
+                    skiprows=1,
+                )
+                print(f"  カラム: {list(df.columns)}")
+                print(f"  行数: {len(df)}")
 
-            code_cols  = [c for c in df.columns if "コード" in str(c)]
-            ratio_cols = [c for c in df.columns if "倍率" in str(c)]
+                code_cols  = [c for c in df.columns if "コード" in str(c)]
+                ratio_cols = [c for c in df.columns if "倍率" in str(c)]
+                print(f"  コード列: {code_cols}")
+                print(f"  倍率列: {ratio_cols}")
 
-            if not code_cols or not ratio_cols:
+                if not code_cols or not ratio_cols:
+                    print("  → カラムが見つからずスキップ")
+                    continue
+
+                df = df[[code_cols[0], ratio_cols[0]]].copy()
+                df.columns = ["コード", "信用倍率"]
+                df["信用倍率"] = pd.to_numeric(df["信用倍率"], errors="coerce")
+                df = df.dropna(subset=["信用倍率"])
+                df = df[df["信用倍率"] > 0]
+
+                print(f"\n✅ 取得成功: {len(df)}銘柄 (基準日: {date_str})")
+                return df
+
+            except Exception as e:
+                print(f"  CSV読み込みエラー: {e}")
+                try:
+                    df = pd.read_csv(
+                        io.BytesIO(resp.content),
+                        encoding="utf-8",
+                        skiprows=1,
+                    )
+                    print(f"  UTF-8で再試行 → カラム: {list(df.columns)}")
+                except Exception as e2:
+                    print(f"  UTF-8も失敗: {e2}")
                 continue
-
-            df = df[[code_cols[0], ratio_cols[0]]].copy()
-            df.columns = ["コード", "信用倍率"]
-            df["信用倍率"] = pd.to_numeric(df["信用倍率"], errors="coerce")
-            df = df.dropna(subset=["信用倍率"])
-            df = df[df["信用倍率"] > 0]
-
-            print(f"✅ 信用倍率データ取得: {len(df)}銘柄 (基準日: {date_str})")
-            return df
 
         except Exception as e:
-            print(f"  {date_str} 取得失敗: {e}")
+            print(f"  接続エラー: {e}")
             continue
 
     return pd.DataFrame()
 
 
 def main():
+    print("=" * 50)
+    print("信用倍率データ取得テスト")
+    print("=" * 50)
+
     df = fetch_margin_ratios()
 
     if df.empty:
-        print("❌ データ取得失敗")
+        print("\n❌ 全ての試行が失敗しました")
+        print("→ JPXのURL形式が変更された可能性があります")
         return
 
-    total = len(df)
+    total  = len(df)
     ratios = df["信用倍率"]
 
     print()
@@ -107,18 +137,6 @@ def main():
         bar  = "█" * (count // 5)
         rate = count / total * 100
         print(f"  {label:>8}  {count:>5}銘柄 ({rate:4.1f}%)  {bar}")
-
-    print()
-    print("=" * 45)
-    print("💡 推奨閾値の目安")
-    print("=" * 45)
-    for threshold in [3, 5, 10, 20]:
-        excluded = (ratios > threshold).sum()
-        rate     = excluded / total * 100
-        print(f"  閾値{threshold:>2}倍 → 除外{rate:.0f}% / 残り{total-excluded}銘柄")
-
-    print()
-    print("MAX_MARGIN_RATIO = X.X  を signal_system.py の設定セクションで変更できます")
 
 
 if __name__ == "__main__":
