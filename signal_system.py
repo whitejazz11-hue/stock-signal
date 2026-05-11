@@ -805,7 +805,6 @@ def main():
         gc          = get_sheets_client()
         spreadsheet = gc.open_by_key(get_env("SHEETS_ID"))
 
-        already_sent = has_already_sent(spreadsheet, date_str_sheet)
 
         update_result = update_sheets(
             spreadsheet,
@@ -817,11 +816,6 @@ def main():
 
         positions = get_portfolio_summary(spreadsheet)
         print(f"   保有ポジション：{len(positions)} 件")
-
-        if already_sent:
-            print(f"⚠️ {date_str_sheet} はすでに配信ログに記録済みです。")
-            print("重複メール防止のため、今回はメール送信せず終了します。")
-            return
 
     except Exception as e:
         print(f"⚠️ Sheets更新エラー（メール送信は継続）: {e}")
