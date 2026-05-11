@@ -31,5 +31,5 @@ jobs:
           GOOGLE_SHEETS_CREDENTIALS:  ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           SHEETS_ID:                  ${{ secrets.SHEETS_ID }}
         run: |
-          pip install requests pandas
-          python check_margin.py
+          pip install yfinance pandas numpy gspread google-auth requests openpyxl xlrd
+          python signal_system.py
