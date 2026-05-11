@@ -413,7 +413,9 @@ def main():
         positions   = get_portfolio_summary(ss)
         print(f"   保有ポジション：{len(positions)} 件")
     except Exception as e:
-        print(f"⚠️ Sheets更新エラー（メール送信は継続）: {e}")
+        import traceback
+        print(f"⚠️ Sheets更新エラー（メール送信は継続）:")
+        print(traceback.format_exc())
 
     body    = build_email(latest, volC_rows, gapN_rows, positions)
     subject = f"【株式シグナル v3】{date_str} / {total}銘柄"
