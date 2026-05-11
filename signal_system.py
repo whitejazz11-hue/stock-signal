@@ -1,14 +1,22 @@
 """
-株式シグナル通知システム v3.1
+株式シグナル通知システム v4.0
 毎日自動実行 → Gmail送信 + Google Sheets記録・損益追跡
+
+変更点 (v3.1 → v4.0):
+  - 対象銘柄をJPXプライム市場全銘柄（約1,650社）に拡大
+  - 信用倍率フィルター追加（MAX_MARGIN_RATIO を超える銘柄を除外）
+  - fetch_prime_stocks() / fetch_margin_ratios() を追加
+  - fetch_data() / calc_signals() に stocks 引数を追加
 
 GitHub Actions で動かすスクリプト
 """
 
+import io
 import os
 import json
 import smtplib
 import warnings
+import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from email.mime.multipart import MIMEMultipart
@@ -26,10 +34,11 @@ warnings.filterwarnings("ignore")
 # 設定
 # ============================================================
 
-VOL_WINDOW    = 20
-VOL_MULT      = 3.0
-GAP_THRESHOLD = -0.05
-HOLDING_DAYS  = 90
+VOL_WINDOW       = 20
+VOL_MULT         = 3.0
+GAP_THRESHOLD    = -0.05
+HOLDING_DAYS     = 90
+MAX_MARGIN_RATIO = 5.0   # 信用倍率がこの値を超える銘柄はシグナルから除外
 
 JST = ZoneInfo("Asia/Tokyo")
 
@@ -47,7 +56,8 @@ RUNLOG_HEADERS = [
     "対象日", "実行日時", "新規シグナル数", "メール件名"
 ]
 
-STOCKS = {
+# JPX取得失敗時のフォールバック（旧来の50銘柄）
+STOCKS_FALLBACK = {
     "7203": "トヨタ自動車",    "7267": "ホンダ",
     "7269": "スズキ",          "7270": "SUBARU",
     "7201": "日産自動車",      "6758": "ソニーグループ",
@@ -81,7 +91,6 @@ STOCKS = {
 # ============================================================
 
 def get_env(name: str) -> str:
-    """GitHub Secrets / 環境変数を安全に取得する"""
     value = os.environ.get(name)
     if not value:
         raise RuntimeError(f"環境変数 {name} が設定されていません")
@@ -89,14 +98,12 @@ def get_env(name: str) -> str:
 
 
 def to_float(value) -> float:
-    """Google Sheetsから取得した文字列をfloatに変換する"""
     if value is None or value == "":
         return 0.0
     return float(str(value).replace(",", "").replace("¥", "").replace("%", "").strip())
 
 
 def is_valid_number(value) -> bool:
-    """NaNや無限大を除外する"""
     try:
         return value is not None and not pd.isna(value) and np.isfinite(float(value))
     except Exception:
@@ -104,20 +111,110 @@ def is_valid_number(value) -> bool:
 
 
 def next_business_day(dt) -> str:
-    """次の平日を YYYY/MM/DD 形式で返す。日本の祝日は未考慮。"""
     return (pd.Timestamp(dt) + pd.offsets.BDay(1)).strftime("%Y/%m/%d")
 
 
 def add_business_days(dt, days: int) -> str:
-    """指定した営業日数後を YYYY/MM/DD 形式で返す。日本の祝日は未考慮。"""
     return (pd.Timestamp(dt) + pd.offsets.BDay(days)).strftime("%Y/%m/%d")
 
 
 def business_days_between(start_dt, end_dt) -> int:
-    """開始日から終了日までの平日数を返す。日本の祝日は未考慮。"""
     start_date = pd.Timestamp(start_dt).date()
     end_date   = pd.Timestamp(end_dt).date()
     return int(np.busday_count(start_date, end_date))
+
+
+# ============================================================
+# JPX データ取得
+# ============================================================
+
+def fetch_prime_stocks() -> dict:
+    """JPXからプライム市場の全銘柄一覧を取得する"""
+    url = (
+        "https://www.jpx.co.jp/markets/statistics-equities"
+        "/misc/tvdivq0000001vg2-att/data_j.xls"
+    )
+    try:
+        resp = requests.get(url, timeout=30)
+        resp.raise_for_status()
+
+        df = pd.read_excel(io.BytesIO(resp.content))
+
+        # プライム市場のみ抽出
+        prime = df[df["市場・商品区分"].str.contains("プライム", na=False)]
+
+        stocks = {}
+        for _, row in prime.iterrows():
+            try:
+                code = str(int(row["コード"])).zfill(4)
+                name = str(row["銘柄名"])
+                stocks[code] = name
+            except Exception:
+                continue
+
+        print(f"✅ プライム銘柄取得: {len(stocks)}社")
+        return stocks
+
+    except Exception as e:
+        print(f"⚠️ プライム銘柄取得失敗: {e}")
+        print("   → フォールバック: 組み込み50銘柄を使用")
+        return STOCKS_FALLBACK
+
+
+def fetch_margin_ratios() -> dict:
+    """JPXから最新の信用倍率を取得する（コード → 倍率）"""
+    today = datetime.now(JST).date()
+
+    for weeks_back in range(4):  # 最大4週遡る
+        days_back  = (today.weekday() - 4) % 7 + weeks_back * 7
+        target     = today - timedelta(days=days_back)
+        date_str   = target.strftime("%Y%m%d")
+        url = (
+            "https://www.jpx.co.jp/markets/statistics-equities"
+            f"/margin/nlsgeu000000xbna-att/data_{date_str}.csv"
+        )
+
+        try:
+            resp = requests.get(url, timeout=30)
+            if resp.status_code != 200:
+                continue
+
+            df = pd.read_csv(
+                io.BytesIO(resp.content),
+                encoding="shift_jis",
+                skiprows=1,
+            )
+
+            # カラム名を柔軟に特定
+            code_cols  = [c for c in df.columns if "コード" in str(c)]
+            ratio_cols = [c for c in df.columns if "倍率" in str(c)]
+
+            if not code_cols or not ratio_cols:
+                print(f"  {date_str}: カラム形式が想定外 → スキップ")
+                continue
+
+            code_col  = code_cols[0]
+            ratio_col = ratio_cols[0]
+
+            result = {}
+            for _, row in df.iterrows():
+                try:
+                    code  = str(int(row[code_col])).zfill(4)
+                    ratio = float(row[ratio_col])
+                    if ratio > 0:
+                        result[code] = ratio
+                except Exception:
+                    continue
+
+            print(f"✅ 信用倍率取得: {len(result)}銘柄 (基準日: {date_str})")
+            return result
+
+        except Exception as e:
+            print(f"  {date_str} 取得失敗: {e}")
+            continue
+
+    print("⚠️ 信用倍率データ取得失敗 → 信用倍率フィルターなしで続行")
+    return {}
 
 
 # ============================================================
@@ -157,8 +254,7 @@ def get_or_create_sheet(spreadsheet, sheet_name, headers=None):
 
 
 def has_already_sent(spreadsheet, date_str: str) -> bool:
-    """同じ対象日のメールをすでに送っているか確認する"""
-    ws = get_or_create_sheet(spreadsheet, SHEET_RUNLOG, RUNLOG_HEADERS)
+    ws   = get_or_create_sheet(spreadsheet, SHEET_RUNLOG, RUNLOG_HEADERS)
     rows = ws.get_all_values()
 
     if len(rows) <= 1:
@@ -172,7 +268,6 @@ def has_already_sent(spreadsheet, date_str: str) -> bool:
 
 
 def add_run_log(spreadsheet, date_str: str, new_count: int, subject: str):
-    """メール送信後に配信ログへ記録する"""
     ws = get_or_create_sheet(spreadsheet, SHEET_RUNLOG, RUNLOG_HEADERS)
     ws.append_row([
         date_str,
@@ -186,8 +281,9 @@ def add_run_log(spreadsheet, date_str: str, new_count: int, subject: str):
 # データ取得・シグナル計算
 # ============================================================
 
-def fetch_data():
-    tickers = [f"{code}.T" for code in STOCKS.keys()]
+def fetch_data(stocks: dict):
+    """株価データをyfinanceから取得する"""
+    tickers = [f"{code}.T" for code in stocks.keys()]
     start   = (datetime.now(JST) - timedelta(days=240)).strftime("%Y-%m-%d")
     end     = (datetime.now(JST) + timedelta(days=1)).strftime("%Y-%m-%d")
 
@@ -218,14 +314,15 @@ def fetch_data():
     open_.columns  = [str(c).replace(".T", "") for c in open_.columns]
     volume.columns = [str(c).replace(".T", "") for c in volume.columns]
 
-    close  = close.reindex(columns=list(STOCKS.keys()))
-    open_  = open_.reindex(columns=list(STOCKS.keys()))
-    volume = volume.reindex(columns=list(STOCKS.keys()))
+    close  = close.reindex(columns=list(stocks.keys()))
+    open_  = open_.reindex(columns=list(stocks.keys()))
+    volume = volume.reindex(columns=list(stocks.keys()))
 
     return close, open_, volume
 
 
-def calc_signals(close, open_, volume):
+def calc_signals(close, open_, volume, stocks: dict):
+    """シグナルを計算する"""
     valid_close = close.dropna(how="all")
     if valid_close.empty:
         raise RuntimeError("有効な終値データがありません")
@@ -242,7 +339,7 @@ def calc_signals(close, open_, volume):
 
     def build_hits(signal_df):
         latest_signal = signal_df.loc[latest].fillna(False)
-        hit_codes = latest_signal[latest_signal].index.tolist()
+        hit_codes     = latest_signal[latest_signal].index.tolist()
 
         rows = []
         for code in hit_codes:
@@ -258,12 +355,12 @@ def calc_signals(close, open_, volume):
             vol_value = vol_ratio.loc[latest, code]
 
             rows.append({
-                "code": code,
-                "name": STOCKS.get(code, code),
-                "price": float(price),
-                "ret": float(ret_value) if is_valid_number(ret_value) else 0.0,
-                "gap": float(gap_value) if is_valid_number(gap_value) else 0.0,
-                "vol_ratio": float(vol_value) if is_valid_number(vol_value) else 0.0,
+                "code":      code,
+                "name":      stocks.get(code, code),
+                "price":     float(price),
+                "ret":       float(ret_value)  if is_valid_number(ret_value)  else 0.0,
+                "gap":       float(gap_value)  if is_valid_number(gap_value)  else 0.0,
+                "vol_ratio": float(vol_value)  if is_valid_number(vol_value)  else 0.0,
             })
 
         return rows
@@ -279,9 +376,9 @@ def calc_signals(close, open_, volume):
 # ============================================================
 
 def get_timing_advice(signal, ret_pct, vol_ratio, gap_pct):
-    ret = float(ret_pct) if is_valid_number(ret_pct) else 0.0
+    ret = float(ret_pct)  if is_valid_number(ret_pct)  else 0.0
     vol = float(vol_ratio) if is_valid_number(vol_ratio) else 0.0
-    gap = float(gap_pct) if is_valid_number(gap_pct) else 0.0
+    gap = float(gap_pct)  if is_valid_number(gap_pct)  else 0.0
 
     if signal == "volC":
         if ret <= -10:
@@ -348,8 +445,6 @@ def update_sheets(spreadsheet, latest_date, volC_rows, gapN_rows, close):
     date_str   = latest_date.strftime("%Y/%m/%d")
 
     existing_keys = set()
-
-    # 既存ポジション更新
     updates_count = 0
 
     if len(all_rows) > 1:
@@ -361,7 +456,6 @@ def update_sheets(spreadsheet, latest_date, volC_rows, gapN_rows, close):
 
             status = row[10] if len(row) > 10 else ""
 
-            # 「保有中」だけでなく「期間終了」も更新し続ける
             if ("保有中" not in status) and ("期間終了" not in status):
                 continue
 
@@ -372,12 +466,10 @@ def update_sheets(spreadsheet, latest_date, volC_rows, gapN_rows, close):
             try:
                 buy_price = to_float(row[4])
                 if buy_price <= 0:
-                    print(f"  行{i}: 買値が不正のためスキップ")
                     continue
 
                 current_raw = close.loc[latest_date, code]
                 if not is_valid_number(current_raw):
-                    print(f"  行{i}: {code} の現在値が取得できないためスキップ")
                     continue
 
                 current   = float(current_raw)
@@ -385,8 +477,7 @@ def update_sheets(spreadsheet, latest_date, volC_rows, gapN_rows, close):
                 sig_dt    = datetime.strptime(row[0], "%Y/%m/%d")
                 hold_days = business_days_between(sig_dt, latest_date)
 
-                sell_by = row[6] if len(row) > 6 else ""
-
+                sell_by    = row[6] if len(row) > 6 else ""
                 new_status = "保有中📈" if pnl_pct >= 0 else "保有中📉"
 
                 try:
@@ -458,10 +549,7 @@ def update_sheets(spreadsheet, latest_date, volC_rows, gapN_rows, close):
 
     print(f"✅ Sheets: 既存{updates_count}件更新 / 新規{len(new_rows)}件追加")
 
-    return {
-        "updated": updates_count,
-        "new": len(new_rows),
-    }
+    return {"updated": updates_count, "new": len(new_rows)}
 
 
 def get_portfolio_summary(spreadsheet):
@@ -482,14 +570,14 @@ def get_portfolio_summary(spreadsheet):
         if "保有中" in status or "期間終了" in status:
             try:
                 positions.append({
-                    "code": row[1],
-                    "name": row[2],
-                    "signal": row[3],
-                    "buy": to_float(row[4]) if row[4] else 0.0,
+                    "code":    row[1],
+                    "name":    row[2],
+                    "signal":  row[3],
+                    "buy":     to_float(row[4]) if row[4] else 0.0,
                     "current": to_float(row[7]) if row[7] else 0.0,
-                    "pnl": to_float(row[8]) if row[8] else 0.0,
-                    "days": int(to_float(row[9])) if row[9] else 0,
-                    "status": status,
+                    "pnl":     to_float(row[8]) if row[8] else 0.0,
+                    "days":    int(to_float(row[9])) if row[9] else 0,
+                    "status":  status,
                     "sell_by": row[6] if len(row) > 6 else "",
                 })
             except Exception:
@@ -513,7 +601,7 @@ def build_email(latest_date, volC_rows, gapN_rows, positions):
     total = len(set(r["code"] for r in volC_rows) | set(r["code"] for r in gapN_rows))
 
     lines = [
-        f"【株式シグナルレポート v3.1】{date_str}（{weekday}）",
+        f"【株式シグナルレポート v4.0】{date_str}（{weekday}）",
         "",
     ]
 
@@ -538,7 +626,6 @@ def build_email(latest_date, volC_rows, gapN_rows, positions):
                     ),
                     "",
                 ]
-
                 advice, _, _, _ = get_timing_advice(
                     "both", r["ret"], r["vol_ratio"], r["gap"]
                 )
@@ -557,7 +644,6 @@ def build_email(latest_date, volC_rows, gapN_rows, positions):
                     ),
                     "",
                 ]
-
                 advice, _, _, _ = get_timing_advice(
                     "volC", r["ret"], r["vol_ratio"], r["gap"]
                 )
@@ -572,7 +658,6 @@ def build_email(latest_date, volC_rows, gapN_rows, positions):
                     f"  ¥{r['price']:,.0f}  gap{r['gap']:+.1f}%",
                     "",
                 ]
-
                 advice, _, _, _ = get_timing_advice(
                     "gapN", r["ret"], r["vol_ratio"], r["gap"]
                 )
@@ -596,17 +681,15 @@ def build_email(latest_date, volC_rows, gapN_rows, positions):
 
         for p in positions:
             emoji = "📈" if p["pnl"] >= 0 else "📉"
-
             lines.append(
                 f"  {p['code']:<6} {p['name'][:9]:<10}"
                 f"  ¥{p['buy']:>6,.0f}  ¥{p['current']:>6,.0f}"
                 f"  {p['pnl']:>+6.1f}%  {p['days']:>3}日 {emoji}"
             )
-
             total_pnl += p["pnl"]
             wins += 1 if p["pnl"] >= 0 else 0
 
-        avg = total_pnl / len(positions)
+        avg      = total_pnl / len(positions)
         win_rate = wins / len(positions) * 100
 
         lines += [
@@ -644,8 +727,8 @@ def send_email(subject, body):
     to_email   = get_env("NOTIFY_EMAIL")
 
     msg = MIMEMultipart()
-    msg["From"] = gmail_user
-    msg["To"] = to_email
+    msg["From"]    = gmail_user
+    msg["To"]      = to_email
     msg["Subject"] = subject
 
     msg.attach(MIMEText(body, "plain", "utf-8"))
@@ -665,16 +748,35 @@ def send_email(subject, body):
 def main():
     print(f"▶ 実行開始：{datetime.now(JST).strftime('%Y-%m-%d %H:%M')} JST")
 
+    # ── 銘柄リスト取得 ──
+    print("📋 プライム市場銘柄リスト取得中...")
+    stocks = fetch_prime_stocks()
+
+    # ── 信用倍率フィルター ──
+    print("📋 信用倍率データ取得中...")
+    margin_ratios = fetch_margin_ratios()
+
+    if margin_ratios:
+        excluded = {
+            code for code, ratio in margin_ratios.items()
+            if ratio > MAX_MARGIN_RATIO
+        }
+        stocks = {k: v for k, v in stocks.items() if k not in excluded}
+        print(
+            f"   信用倍率 > {MAX_MARGIN_RATIO} で除外: {len(excluded)}銘柄 "
+            f"/ 対象残り: {len(stocks)}銘柄"
+        )
+
+    # ── 株価データ取得・シグナル計算 ──
     print("📥 データ取得中...")
-    close, open_, volume = fetch_data()
+    close, open_, volume = fetch_data(stocks)
 
     print("📊 シグナル計算中...")
-    latest, volC_rows, gapN_rows = calc_signals(close, open_, volume)
+    latest, volC_rows, gapN_rows = calc_signals(close, open_, volume, stocks)
 
-    today_jst = datetime.now(JST).date()
+    today_jst        = datetime.now(JST).date()
     latest_date_only = pd.Timestamp(latest).date()
 
-    # 休場日・土日・祝日・データ未反映日の重複送信防止
     if latest_date_only != today_jst:
         print(
             f"⚠️ 最新株価日が本日ではありません: "
@@ -683,7 +785,7 @@ def main():
         print("休場日、または本日の株価データが未反映のため、メール送信せず終了します。")
         return
 
-    date_str_mail = latest.strftime("%Y年%m月%d日")
+    date_str_mail  = latest.strftime("%Y年%m月%d日")
     date_str_sheet = latest.strftime("%Y/%m/%d")
 
     total = len(set(r["code"] for r in volC_rows) | set(r["code"] for r in gapN_rows))
@@ -693,14 +795,14 @@ def main():
         f"出来高C:{len(volC_rows)} / ギャップN:{len(gapN_rows)}"
     )
 
-    positions = []
-    spreadsheet = None
+    positions     = []
+    spreadsheet   = None
     update_result = {"updated": 0, "new": 0}
 
     print("📊 Google Sheets 更新中...")
 
     try:
-        gc = get_sheets_client()
+        gc          = get_sheets_client()
         spreadsheet = gc.open_by_key(get_env("SHEETS_ID"))
 
         already_sent = has_already_sent(spreadsheet, date_str_sheet)
@@ -714,7 +816,6 @@ def main():
         )
 
         positions = get_portfolio_summary(spreadsheet)
-
         print(f"   保有ポジション：{len(positions)} 件")
 
         if already_sent:
@@ -722,17 +823,14 @@ def main():
             print("重複メール防止のため、今回はメール送信せず終了します。")
             return
 
-    except Exception:
-        import traceback
-        print("⚠️ Sheets更新エラー（メール送信は継続）:")
-        print(traceback.format_exc())
+    except Exception as e:
+        print(f"⚠️ Sheets更新エラー（メール送信は継続）: {e}")
 
-    body = build_email(latest, volC_rows, gapN_rows, positions)
-
-    subject = f"【株式シグナル v3.1】{date_str_mail} / {total}銘柄"
+    body    = build_email(latest, volC_rows, gapN_rows, positions)
+    subject = f"【株式シグナル v4.0】{date_str_mail} / {total}銘柄"
 
     if positions:
-        avg = sum(p["pnl"] for p in positions) / len(positions)
+        avg      = sum(p["pnl"] for p in positions) / len(positions)
         subject += f" | 保有{len(positions)}件 平均{avg:+.1f}%"
 
     print("\n📧 メール送信中...")
