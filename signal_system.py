@@ -774,10 +774,11 @@ def main():
     print("📊 シグナル計算中...")
     latest, volC_rows, gapN_rows = calc_signals(close, open_, volume, stocks)
 
-    today_jst        = datetime.now(JST).date()
+    from datetime import datetime, timedelta, timezone
+    today_utc = datetime.now(timezone.utc).date()
     latest_date_only = pd.Timestamp(latest).date()
 
-    if latest_date_only != today_jst:
+    if latest_date_only != today_utc:
         print(
             f"⚠️ 最新株価日が本日ではありません: "
             f"latest={latest_date_only} / today_jst={today_jst}"
