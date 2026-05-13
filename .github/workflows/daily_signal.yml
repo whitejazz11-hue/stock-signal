@@ -21,7 +21,7 @@ jobs:
 
       - name: ライブラリをインストール
         run: |
-          pip install yfinance pandas numpy gspread google-auth requests openpyxl xlrd
+          pip install yfinance pandas numpy gspread google-auth requests openpyxl xlrd google-genai
 
       - name: シグナル通知を実行
         env:
@@ -30,6 +30,7 @@ jobs:
           NOTIFY_EMAIL:               ${{ secrets.NOTIFY_EMAIL }}
           GOOGLE_SHEETS_CREDENTIALS:  ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           SHEETS_ID:                  ${{ secrets.SHEETS_ID }}
+          GEMINI_API_KEY:             ${{ secrets.GEMINI_API_KEY }}  ← 追加
         run: |
-          pip install yfinance pandas numpy gspread google-auth requests openpyxl xlrd
+          pip install yfinance pandas numpy gspread google-auth requests openpyxl xlrd google-genai
           python signal_system.py
