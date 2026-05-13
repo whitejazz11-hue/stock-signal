@@ -1,12 +1,11 @@
 """
-株式シグナル通知システム v4.0
+株式シグナル通知システム v4.1
 毎日自動実行 → Gmail送信 + Google Sheets記録・損益追跡
 
-変更点 (v3.1 → v4.0):
-  - 対象銘柄をJPXプライム市場全銘柄（約1,650社）に拡大
-  - 信用倍率フィルター追加（MAX_MARGIN_RATIO を超える銘柄を除外）
-  - fetch_prime_stocks() / fetch_margin_ratios() を追加
-  - fetch_data() / calc_signals() に stocks 引数を追加
+変更点 (v4.0 → v4.1):
+  - Gemini API連携追加（⭐両方一致銘柄の下落要因を自動分析）
+  - ⭐銘柄の冗長な「ポイント」行を削除（Gemini分析に置き換え）
+  - タイムゾーン比較をUTCに変更（GitHub Actions遅延対策）
 
 GitHub Actions で動かすスクリプト
 """
@@ -38,7 +37,7 @@ VOL_WINDOW       = 20
 VOL_MULT         = 3.0
 GAP_THRESHOLD    = -0.05
 HOLDING_DAYS     = 90
-MAX_MARGIN_RATIO = 5.0   # 信用倍率がこの値を超える銘柄はシグナルから除外
+MAX_MARGIN_RATIO = 5.0
 
 JST = ZoneInfo("Asia/Tokyo")
 
@@ -125,6 +124,44 @@ def business_days_between(start_dt, end_dt) -> int:
 
 
 # ============================================================
+# Gemini API（下落要因分析）
+# ============================================================
+
+def analyze_drop_reason(code: str, name: str, ret: float, gap: float, date_str: str) -> str:
+    """Gemini + Google検索で⭐銘柄の下落要因を分析する"""
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        return "（GEMINI_API_KEY未設定）"
+
+    try:
+        from google import genai as gai
+        from google.genai.types import Tool, GenerateContentConfig, GoogleSearch
+
+        client = gai.Client(api_key=api_key)
+
+        prompt = (
+            f"{date_str}に{name}（証券コード{code}）の株価が{ret:+.1f}%下落しました。\n"
+            f"最新のニュースをもとに以下を日本語・5行以内で簡潔に教えてください：\n"
+            f"・下落の主な要因（1〜2文）\n"
+            f"・一時的な要因か構造的な問題か\n"
+            f"・逆張りの適性：◎/○/△/× と理由（1文）"
+        )
+
+        response = client.models.generate_content(
+            model="gemini-2.0-flash",
+            contents=prompt,
+            config=GenerateContentConfig(
+                tools=[Tool(google_search=GoogleSearch())]
+            )
+        )
+
+        return response.text.strip()
+
+    except Exception as e:
+        return f"（分析エラー: {e}）"
+
+
+# ============================================================
 # JPX データ取得
 # ============================================================
 
@@ -139,8 +176,6 @@ def fetch_prime_stocks() -> dict:
         resp.raise_for_status()
 
         df = pd.read_excel(io.BytesIO(resp.content))
-
-        # プライム市場のみ抽出
         prime = df[df["市場・商品区分"].str.contains("プライム", na=False)]
 
         stocks = {}
@@ -165,7 +200,7 @@ def fetch_margin_ratios() -> dict:
     """JPXから最新の信用倍率を取得する（コード → 倍率）"""
     today = datetime.now(JST).date()
 
-    for weeks_back in range(4):  # 最大4週遡る
+    for weeks_back in range(4):
         days_back  = (today.weekday() - 4) % 7 + weeks_back * 7
         target     = today - timedelta(days=days_back)
         date_str   = target.strftime("%Y%m%d")
@@ -185,12 +220,10 @@ def fetch_margin_ratios() -> dict:
                 skiprows=1,
             )
 
-            # カラム名を柔軟に特定
             code_cols  = [c for c in df.columns if "コード" in str(c)]
             ratio_cols = [c for c in df.columns if "倍率" in str(c)]
 
             if not code_cols or not ratio_cols:
-                print(f"  {date_str}: カラム形式が想定外 → スキップ")
                 continue
 
             code_col  = code_cols[0]
@@ -253,20 +286,6 @@ def get_or_create_sheet(spreadsheet, sheet_name, headers=None):
     return ws
 
 
-def has_already_sent(spreadsheet, date_str: str) -> bool:
-    ws   = get_or_create_sheet(spreadsheet, SHEET_RUNLOG, RUNLOG_HEADERS)
-    rows = ws.get_all_values()
-
-    if len(rows) <= 1:
-        return False
-
-    for row in rows[1:]:
-        if len(row) >= 1 and row[0] == date_str:
-            return True
-
-    return False
-
-
 def add_run_log(spreadsheet, date_str: str, new_count: int, subject: str):
     ws = get_or_create_sheet(spreadsheet, SHEET_RUNLOG, RUNLOG_HEADERS)
     ws.append_row([
@@ -282,7 +301,6 @@ def add_run_log(spreadsheet, date_str: str, new_count: int, subject: str):
 # ============================================================
 
 def fetch_data(stocks: dict):
-    """株価データをyfinanceから取得する"""
     tickers = [f"{code}.T" for code in stocks.keys()]
     start   = (datetime.now(JST) - timedelta(days=240)).strftime("%Y-%m-%d")
     end     = (datetime.now(JST) + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -322,7 +340,6 @@ def fetch_data(stocks: dict):
 
 
 def calc_signals(close, open_, volume, stocks: dict):
-    """シグナルを計算する"""
     valid_close = close.dropna(how="all")
     if valid_close.empty:
         raise RuntimeError("有効な終値データがありません")
@@ -376,9 +393,9 @@ def calc_signals(close, open_, volume, stocks: dict):
 # ============================================================
 
 def get_timing_advice(signal, ret_pct, vol_ratio, gap_pct):
-    ret = float(ret_pct)  if is_valid_number(ret_pct)  else 0.0
-    vol = float(vol_ratio) if is_valid_number(vol_ratio) else 0.0
-    gap = float(gap_pct)  if is_valid_number(gap_pct)  else 0.0
+    ret = float(ret_pct)   if is_valid_number(ret_pct)   else 0.0
+    vol = float(vol_ratio) if is_valid_number(vol_ratio)  else 0.0
+    gap = float(gap_pct)   if is_valid_number(gap_pct)   else 0.0
 
     if signal == "volC":
         if ret <= -10:
@@ -401,6 +418,13 @@ def get_timing_advice(signal, ret_pct, vol_ratio, gap_pct):
             entry = "翌営業日の寄り付き候補。ただし優先度は低め"
             point = "下落幅は比較的軽め。早めの利確も選択肢"
 
+        advice = (
+            f"  シグナル強度: {strength}\n"
+            f"  エントリー  : {entry}\n"
+            f"  期待リターン: 5日後{e5} / 10日後{e10} / 20日後{e20}\n"
+            f"  ポイント   : {point}"
+        )
+
     elif signal == "gapN":
         if gap <= -10:
             strength = "強🔴"
@@ -418,18 +442,23 @@ def get_timing_advice(signal, ret_pct, vol_ratio, gap_pct):
             entry = "翌営業日の寄り付き候補。ただし優先度は低め"
             point = "出来高Cとの同時シグナルがあれば、より注目度が高い"
 
-    else:  # both
+        advice = (
+            f"  シグナル強度: {strength}\n"
+            f"  エントリー  : {entry}\n"
+            f"  期待リターン: 5日後{e5} / 10日後{e10} / 20日後{e20}\n"
+            f"  ポイント   : {point}"
+        )
+
+    else:  # both → ポイント行なし（Gemini分析に置き換え）
         strength = "最強⭐"
         e5, e10, e20 = "+2.0%", "+3.0%", "+4.3%"
         entry = "翌営業日の寄り付き候補"
-        point = "両シグナル一致。過去検証上は最も注目度が高いが、材料確認は必須"
 
-    advice = (
-        f"  シグナル強度: {strength}\n"
-        f"  エントリー  : {entry}\n"
-        f"  期待リターン: 5日後{e5} / 10日後{e10} / 20日後{e20}\n"
-        f"  ポイント   : {point}"
-    )
+        advice = (
+            f"  シグナル強度: {strength}\n"
+            f"  エントリー  : {entry}\n"
+            f"  期待リターン: 5日後{e5} / 10日後{e10} / 20日後{e20}"
+        )
 
     return advice, e5, e10, e20
 
@@ -496,7 +525,6 @@ def update_sheets(spreadsheet, latest_date, volC_rows, gapN_rows, close):
             except Exception as e:
                 print(f"  行{i}更新エラー: {e}")
 
-    # 新規シグナル追加
     new_rows = []
 
     def make_row(r, signal_type):
@@ -591,7 +619,7 @@ def get_portfolio_summary(spreadsheet):
 # メール作成
 # ============================================================
 
-def build_email(latest_date, volC_rows, gapN_rows, positions):
+def build_email(latest_date, volC_rows, gapN_rows, positions, gemini_analyses: dict):
     both_codes = {r["code"] for r in volC_rows} & {r["code"] for r in gapN_rows}
 
     date_str = latest_date.strftime("%Y年%m月%d日")
@@ -601,16 +629,16 @@ def build_email(latest_date, volC_rows, gapN_rows, positions):
     total = len(set(r["code"] for r in volC_rows) | set(r["code"] for r in gapN_rows))
 
     lines = [
-        f"【株式シグナルレポート v4.0】{date_str}（{weekday}）",
+        f"【株式シグナルレポート v4.1】{date_str}（{weekday}）",
         "",
     ]
 
-    # ── 新規シグナル ──
     if total == 0:
         lines += ["本日はシグナルなし", ""]
     else:
         lines += [f"シグナル銘柄：合計 {total} 銘柄", ""]
 
+        # ⭐ 両方一致
         for r in volC_rows:
             if r["code"] in both_codes:
                 lines += [
@@ -626,11 +654,22 @@ def build_email(latest_date, volC_rows, gapN_rows, positions):
                     ),
                     "",
                 ]
+
                 advice, _, _, _ = get_timing_advice(
                     "both", r["ret"], r["vol_ratio"], r["gap"]
                 )
-                lines += ["【買いタイミング】", advice, ""]
+                lines += [advice, ""]
 
+                # Gemini分析
+                analysis = gemini_analyses.get(r["code"])
+                if analysis:
+                    lines += [
+                        "【AI下落要因分析】",
+                        analysis,
+                        "",
+                    ]
+
+        # 🔵 出来高C
         for r in volC_rows:
             if r["code"] not in both_codes:
                 lines += [
@@ -649,6 +688,7 @@ def build_email(latest_date, volC_rows, gapN_rows, positions):
                 )
                 lines += [advice, ""]
 
+        # 🟠 ギャップN
         for r in gapN_rows:
             if r["code"] not in both_codes:
                 lines += [
@@ -663,7 +703,7 @@ def build_email(latest_date, volC_rows, gapN_rows, positions):
                 )
                 lines += [advice, ""]
 
-    # ── 保有ポジション損益表 ──
+    # 保有ポジション損益表
     if positions:
         lines += [
             "━" * 27,
@@ -699,7 +739,7 @@ def build_email(latest_date, volC_rows, gapN_rows, positions):
             "",
         ]
 
-    # ── フッター ──
+    # フッター
     lines += [
         "━" * 27,
         "📋 分析ベース期待値（参考）",
@@ -748,11 +788,11 @@ def send_email(subject, body):
 def main():
     print(f"▶ 実行開始：{datetime.now(JST).strftime('%Y-%m-%d %H:%M')} JST")
 
-    # ── 銘柄リスト取得 ──
+    # 銘柄リスト取得
     print("📋 プライム市場銘柄リスト取得中...")
     stocks = fetch_prime_stocks()
 
-    # ── 信用倍率フィルター ──
+    # 信用倍率フィルター
     print("📋 信用倍率データ取得中...")
     margin_ratios = fetch_margin_ratios()
 
@@ -767,16 +807,16 @@ def main():
             f"/ 対象残り: {len(stocks)}銘柄"
         )
 
-    # ── 株価データ取得・シグナル計算 ──
+    # 株価データ取得・シグナル計算
     print("📥 データ取得中...")
     close, open_, volume = fetch_data(stocks)
 
     print("📊 シグナル計算中...")
     latest, volC_rows, gapN_rows = calc_signals(close, open_, volume, stocks)
 
-
-    today_utc = datetime.now(timezone.utc).date()
+    today_utc        = datetime.now(timezone.utc).date()
     latest_date_only = pd.Timestamp(latest).date()
+
     if latest_date_only != today_utc:
         print(
             f"⚠️ 最新株価日が本日ではありません: "
@@ -795,6 +835,20 @@ def main():
         f"出来高C:{len(volC_rows)} / ギャップN:{len(gapN_rows)}"
     )
 
+    # ⭐ 両方一致銘柄のGemini分析
+    both_codes = {r["code"] for r in volC_rows} & {r["code"] for r in gapN_rows}
+    gemini_analyses = {}
+
+    if both_codes and os.environ.get("GEMINI_API_KEY"):
+        print(f"🤖 Gemini分析中... ({len(both_codes)}銘柄)")
+        for r in volC_rows:
+            if r["code"] in both_codes:
+                print(f"   分析: {r['code']} {r['name']}")
+                gemini_analyses[r["code"]] = analyze_drop_reason(
+                    r["code"], r["name"], r["ret"], r["gap"], date_str_mail
+                )
+
+    # Google Sheets 更新
     positions     = []
     spreadsheet   = None
     update_result = {"updated": 0, "new": 0}
@@ -804,7 +858,6 @@ def main():
     try:
         gc          = get_sheets_client()
         spreadsheet = gc.open_by_key(get_env("SHEETS_ID"))
-
 
         update_result = update_sheets(
             spreadsheet,
@@ -820,8 +873,8 @@ def main():
     except Exception as e:
         print(f"⚠️ Sheets更新エラー（メール送信は継続）: {e}")
 
-    body    = build_email(latest, volC_rows, gapN_rows, positions)
-    subject = f"【株式シグナル v4.0】{date_str_mail} / {total}銘柄"
+    body    = build_email(latest, volC_rows, gapN_rows, positions, gemini_analyses)
+    subject = f"【株式シグナル v4.1】{date_str_mail} / {total}銘柄"
 
     if positions:
         avg      = sum(p["pnl"] for p in positions) / len(positions)
