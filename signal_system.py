@@ -774,14 +774,13 @@ def main():
     print("📊 シグナル計算中...")
     latest, volC_rows, gapN_rows = calc_signals(close, open_, volume, stocks)
 
-    from datetime import datetime, timedelta, timezone
+
     today_utc = datetime.now(timezone.utc).date()
     latest_date_only = pd.Timestamp(latest).date()
-
     if latest_date_only != today_utc:
         print(
             f"⚠️ 最新株価日が本日ではありません: "
-            f"latest={latest_date_only} / today_jst={today_jst}"
+            f"latest={latest_date_only} / today_utc={today_utc}"
         )
         print("休場日、または本日の株価データが未反映のため、メール送信せず終了します。")
         return
