@@ -140,13 +140,12 @@ def analyze_drop_reason(code: str, name: str, ret: float, gap: float, date_str: 
         client = gai.Client(api_key=api_key)
 
         prompt = (
-            f"{date_str}に{name}（証券コード{code}）の株価が{ret:+.1f}%下落しました。\n"
-            f"最新のニュースをもとに以下を日本語・5行以内で簡潔に教えてください：\n"
-            f"・下落の主な要因（1〜2文）\n"
-            f"・一時的な要因か構造的な問題か\n"
-            f"・逆張りの適性：◎/○/△/× と理由（1文）"
+            f"{date_str}に{name}(コード{code})の株価が{ret:+.1f}%下落しました。"
+            f"最新ニュースをもとに日本語5行以内で教えてください。"
+            f"1. 下落の主な要因(1〜2文) "
+            f"2. 一時的か構造的か "
+            f"3. 逆張りの適性(高い/中程度/低い)と理由(1文)"
         )
-
         response = client.models.generate_content(
             model="gemini-2.0-flash",
             contents=prompt,
