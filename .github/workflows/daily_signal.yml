@@ -31,7 +31,7 @@ jobs:
           GOOGLE_SHEETS_CREDENTIALS:  ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
           SHEETS_ID:                  ${{ secrets.SHEETS_ID }}
           GEMINI_API_KEY:             ${{ secrets.GEMINI_API_KEY }}
-          PYTHONUTF8: "1"             ← 追加
+          PYTHONUTF8: "1"             
         run: |
           pip install yfinance pandas numpy gspread google-auth requests openpyxl xlrd google-genai
           python signal_system.py
