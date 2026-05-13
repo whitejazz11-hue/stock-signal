@@ -147,7 +147,7 @@ def analyze_drop_reason(code: str, name: str, ret: float, gap: float, date_str: 
             f"3. 逆張りの適性(高い/中程度/低い)と理由(1文)"
         )
         response = client.models.generate_content(
-            model="gemini-1.5-flash",
+            model="gemini-2.0-flash-lite",
             contents=prompt,
             config=GenerateContentConfig(
                 tools=[Tool(google_search=GoogleSearch())]
