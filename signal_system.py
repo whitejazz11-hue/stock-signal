@@ -180,37 +180,29 @@ def get_expected_return(signal_type: str) -> str:
 # ============================================================
 
 def fetch_kabutan_news(code: str, name: str) -> str:
-    """Yahoo ファイナンスから銘柄固有のニュースを取得する"""
+    """Google ニュースRSSから銘柄関連ニュースを取得する"""
     try:
-        url = f"https://finance.yahoo.co.jp/quote/{code}.T/news"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                          "AppleWebKit/537.36 (KHTML, like Gecko) "
-                          "Chrome/120.0.0.0 Safari/537.36"
-        }
-        resp = requests.get(url, timeout=10, headers=headers)
+        import xml.etree.ElementTree as ET
+        from urllib.parse import quote
+
+        query = quote(f"{name} 株価 決算")
+        url   = (
+            f"https://news.google.com/rss/search"
+            f"?q={query}&hl=ja&gl=JP&ceid=JP:ja"
+        )
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp    = requests.get(url, timeout=10, headers=headers)
 
         if resp.status_code != 200:
             return f"ニュース取得失敗（HTTP {resp.status_code}）"
 
-        soup  = BeautifulSoup(resp.content, "html.parser")
+        root  = ET.fromstring(resp.content)
         items = []
 
-        for selector in [
-            "a[href*='/news/detail/']",
-            ".newsItem a",
-            "li a[data-cl-params]",
-            "ul li a",
-        ]:
-            found = soup.select(selector)
-            for el in found[:6]:
-                text = el.get_text(strip=True)
-                if text and len(text) > 10 and len(text) < 100:
-                    items.append(text)
-            if items:
-                break
-
-        items = list(dict.fromkeys(items))  # 重複除去
+        for item in root.findall(".//item")[:5]:
+            title = item.findtext("title")
+            if title and len(title) > 5:
+                items.append(title.strip())
 
         if not items:
             return f"{name}の直近ニュースなし"
