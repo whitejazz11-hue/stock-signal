@@ -180,34 +180,37 @@ def get_expected_return(signal_type: str) -> str:
 # ============================================================
 
 def fetch_kabutan_news(code: str, name: str) -> str:
-    """Google ニュースRSSから銘柄関連ニュースを取得する"""
+    """かぶたんから直近ニュース見出しを取得する"""
     try:
-        import xml.etree.ElementTree as ET
-        from urllib.parse import quote
-
-        query = quote(f"{name} 株価 決算")
-        url   = (
-            f"https://news.google.com/rss/search"
-            f"?q={query}&hl=ja&gl=JP&ceid=JP:ja"
-        )
-        headers = {"User-Agent": "Mozilla/5.0"}
-        resp    = requests.get(url, timeout=10, headers=headers)
+        url = f"https://kabutan.jp/stock/news?code={code}"
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; StockBot/1.0)"}
+        resp = requests.get(url, timeout=10, headers=headers)
 
         if resp.status_code != 200:
             return f"ニュース取得失敗（HTTP {resp.status_code}）"
 
-        root  = ET.fromstring(resp.content)
-        items = []
+        soup = BeautifulSoup(resp.content, "html.parser")
 
-        for item in root.findall(".//item")[:5]:
-            title = item.findtext("title")
-            if title and len(title) > 5:
-                items.append(title.strip())
+        news_items = []
 
-        if not items:
-            return f"{name}の直近ニュースなし"
+        # 複数のセレクタを試す
+        for selector in [
+            "table.s-news-list td.s-news-title a",
+            ".news_list a",
+            "a[href*='/news/']",
+        ]:
+            items = soup.select(selector)
+            for item in items[:5]:
+                text = item.get_text(strip=True)
+                if text and len(text) > 5:
+                    news_items.append(text)
+            if news_items:
+                break
 
-        return "\n".join(f"・{t}" for t in items[:4])
+        if not news_items:
+            return "直近ニュースなし"
+
+        return "\n".join(news_items[:5])
 
     except Exception as e:
         return f"ニュース取得エラー: {e}"
@@ -241,7 +244,7 @@ def analyze_with_gemini(code: str, name: str, signal_type: str,
         )
 
         response = client.models.generate_content(
-            model="gemini-1.5-flash-8b",
+            model="gemini-2.0-flash-lite",
             contents=prompt,
             config=GenerateContentConfig(max_output_tokens=300)
         )
@@ -567,13 +570,13 @@ def process_followup(spreadsheet, close, latest_date, stocks: dict) -> list:
 
 def build_followup_email(qualified: list, t1_date_str: str, t2_date_str: str, signal_date_str: str) -> str:
     lines = [
-        f"【エントリー推奨】{t2_date_str}（明日）寄り付きエントリー候補",
+        f"【買いサイン】{t2_date_str}（明日）寄り付きエントリー候補",
         "",
-        f"シグナル日: {signal_date_str}",
-        f"T+1確認日: {t1_date_str}",
-        f"推奨エントリー: {t2_date_str} 寄り付き",
+        f"シグナル検知日  : {signal_date_str}",
+        f"翌日確認日      : {t1_date_str}",
+        f"推奨エントリー  : {t2_date_str} 寄り付き",
         "",
-        f"条件を満たした銘柄: {len(qualified)}件",
+        f"エントリー推奨銘柄: {len(qualified)}件",
         "",
     ]
 
@@ -583,16 +586,16 @@ def build_followup_email(qualified: list, t1_date_str: str, t2_date_str: str, si
             f"{r['signal_type']}",
             "━" * 27,
             f"  {r['code']} {r['name']}",
-            f"  T日終値    : ¥{r['t_close']:,.0f}",
-            f"  T+1値動き  : {r['t1_ret']:+.1f}%",
-            f"  判定理由   : {r['reason']}",
-            f"  期待リターン: {r['expected']}（過去検証ベース）",
+            f"  シグナル日終値  : ¥{r['t_close']:,.0f}",
+            f"  翌日の値動き    : {r['t1_ret']:+.1f}%",
+            f"  推奨理由        : {r['reason']}",
+            f"  期待リターン    : {r['expected']}（過去検証ベース）",
             "",
         ]
 
         if r.get("gemini"):
             lines += [
-                "【直近ニュース（かぶたん）】",
+                "【関連ニュース】",
                 r["gemini"],
                 "",
             ]
@@ -619,33 +622,33 @@ def get_timing_advice(signal, ret_pct, vol_ratio, gap_pct):
     if signal == "volC":
         if ret <= -10:
             strength = "強🔴"; e5, e10, e20 = "+8.7%", "-", "-"
-            point = "大幅下落。T+1が+5%以上反発すれば翌日エントリー"
+            point = "大幅下落。翌日+5%以上反発すれば翌々日エントリー"
         elif ret <= -5:
             strength = "中🟡"; e5, e10, e20 = "+8.7%", "-", "-"
-            point = f"出来高{vol:.1f}x。T+1の反発を確認してから判断"
+            point = f"出来高{vol:.1f}x。翌日の反発を確認してから判断"
         else:
             strength = "弱🟢"; e5, e10, e20 = "+8.7%", "-", "-"
-            point = "T+1が+5%以上反発した場合のみエントリー検討"
+            point = "翌日+5%以上反発した場合のみエントリー検討"
 
     elif signal == "gapN":
         if gap <= -10:
             strength = "強🔴"; e5, e10, e20 = "+7.5〜8.2%", "-", "-"
-            point = "大ギャップ。T+1が-5%以下続落 or +5%以上反発でエントリー"
+            point = "大きな窓開け下落。翌日-5%以下続落 or +5%以上反発でエントリー"
         elif gap <= -7:
             strength = "中🟡"; e5, e10, e20 = "+7.5〜8.2%", "-", "-"
-            point = "T+1の値動きで判断。続落 or 大幅反発を待つ"
+            point = "翌日の値動きで判断。続落 or 大幅反発を待つ"
         else:
             strength = "弱🟢"; e5, e10, e20 = "+7.5〜8.2%", "-", "-"
-            point = "T+1が-5%以下続落 or +5%以上反発でエントリー検討"
+            point = "翌日-5%以下続落 or +5%以上反発でエントリー検討"
 
     else:  # both
         strength = "最強⭐"; e5, e10, e20 = "+9.8%", "-", "-"
-        point = "T+1が+5%以上反発でエントリー"
+        point = "翌日+5%以上反発でエントリー"
 
     advice = (
-        f"  シグナル強度: {strength}\n"
-        f"  T+2期待値  : {e5}（T+1条件達成時・過去検証ベース）\n"
-        f"  明日の判断 : {point}"
+        f"  シグナル強度  : {strength}\n"
+        f"  翌々日期待値  : {e5}（翌日条件達成時・過去検証ベース）\n"
+        f"  明日の判断    : {point}"
     )
 
     return advice, e5, e10, e20
@@ -664,10 +667,10 @@ def build_candidate_email(latest_date, volC_rows, gapN_rows):
     total = len(set(r["code"] for r in volC_rows) | set(r["code"] for r in gapN_rows))
 
     lines = [
-        f"【要注目候補】{date_str}（{weekday}）シグナル検知",
+        f"【逆張り候補】{date_str}（{weekday}）シグナル検知",
         "",
         f"明日（{t1_str}）の値動きを確認してください。",
-        f"条件を満たした銘柄は{t1_str}夕方に「エントリー推奨」メールでお知らせします。",
+        f"明日の引け後に条件を満たした銘柄をお知らせします。",
         "",
         f"本日の候補: {total}銘柄",
         "",
@@ -724,8 +727,8 @@ def build_candidate_email(latest_date, volC_rows, gapN_rows):
 
     lines += [
         "━" * 27,
-        f"エントリー推奨メール配信予定: {t1_str}（T+1確認後）",
-        "条件: T+1が+5%以上反発 / ギャップNは-5%以下続落も対象",
+        f"買いサインメール配信予定: {t1_str}（翌日引け後）",
+        "条件: 翌日+5%以上反発 / 窓開け下落銘柄は-5%以下続落も対象",
         "",
         "⚠️ 投資判断はご自身でお願いします",
         "⚠️ 必ずニュース・決算を確認してから判断してください",
@@ -935,7 +938,7 @@ def main():
 
         # Gemini分析（エントリー推奨銘柄のみ）
         if qualified:
-            print(f"📰 かぶたんニュース取得中... ({len(qualified)}銘柄)")
+            print(f"📰 関連ニュース取得中... ({len(qualified)}銘柄)")
             for r in qualified:
                 print(f"   {r['code']} {r['name']}")
                 r["gemini"] = fetch_kabutan_news(r["code"], r["name"])
@@ -944,18 +947,18 @@ def main():
         if qualified:
             followup_body    = build_followup_email(
                 qualified,
-                t1_date_str    = latest.strftime("%Y年%m月%d日"),
-                t2_date_str    = t2_date.strftime("%Y年%m月%d日"),
+                t1_date_str     = latest.strftime("%Y年%m月%d日"),
+                t2_date_str     = t2_date.strftime("%Y年%m月%d日"),
                 signal_date_str = (pd.Timestamp(latest) - pd.offsets.BDay(1)).strftime("%Y年%m月%d日")
             )
             followup_subject = (
-                f"【エントリー推奨】{t2_date.strftime('%m月%d日')}寄り付き "
+                f"【買いサイン】{t2_date.strftime('%m月%d日')}寄り付き "
                 f"/ {len(qualified)}銘柄"
             )
-            print("\n📧 フォローアップメール送信中...")
+            print("\n📧 買いサインメール送信中...")
             send_email(followup_subject, followup_body)
         else:
-            print("   エントリー推奨銘柄なし → フォローアップメールなし")
+            print("   買いサイン銘柄なし → メールなし")
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # 処理②: 当日シグナル（候補通知）
@@ -973,8 +976,8 @@ def main():
     if total > 0:
         candidate_body    = build_candidate_email(latest, volC_rows, gapN_rows)
         candidate_subject = (
-            f"【要注目候補】{date_str_mail} / {total}銘柄 "
-            f"→ {t1_date.strftime('%m月%d日')}値動き確認"
+            f"【逆張り候補】{date_str_mail} / {total}銘柄"
+            f"（{t1_date.strftime('%m月%d日')}値動き確認）"
         )
         print("\n📧 候補通知メール送信中...")
         send_email(candidate_subject, candidate_body)
