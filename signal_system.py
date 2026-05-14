@@ -1,13 +1,17 @@
 """
-株式シグナル通知システム v4.1
-毎日自動実行 → Gmail送信 + Google Sheets記録・損益追跡
+株式シグナル通知システム v5.0
+毎日自動実行 → 2段階メール配信
 
-変更点 (v4.0 → v4.1):
-  - Gemini API連携追加（⭐両方一致銘柄の下落要因を自動分析）
-  - ⭐銘柄の冗長な「ポイント」行を削除（Gemini分析に置き換え）
-  - タイムゾーン比較をUTCに変更（GitHub Actions遅延対策）
+【v5.0 変更点】
+  処理①: 前日シグナルのT+1値動きを確認 → 条件を満たした銘柄を「エントリー推奨」メール
+  処理②: 当日シグナルを検知 → 「要注目候補」メール
 
-GitHub Actions で動かすスクリプト
+エントリー条件（T+2始値買い）:
+  出来高C  : T+1が+5%以上
+  ギャップN : T+1が+5%以上 または -5%以下
+  両方一致  : T+1が+5%以上
+
+Gemini分析: かぶたんニュースを取得してGeminiに渡す
 """
 
 import io
@@ -26,6 +30,7 @@ import pandas as pd
 import yfinance as yf
 import gspread
 from google.oauth2.service_account import Credentials
+from bs4 import BeautifulSoup
 
 warnings.filterwarnings("ignore")
 
@@ -33,16 +38,22 @@ warnings.filterwarnings("ignore")
 # 設定
 # ============================================================
 
-VOL_WINDOW       = 20
-VOL_MULT         = 3.0
-GAP_THRESHOLD    = -0.05
-HOLDING_DAYS     = 90
-MAX_MARGIN_RATIO = 5.0
+VOL_WINDOW    = 20
+VOL_MULT      = 3.0
+GAP_THRESHOLD = -0.05
+HOLDING_DAYS  = 90
+
+# エントリー条件（T+1値動きの閾値）
+VOLC_ENTRY_UP    =  5.0  # 出来高C: T+1が+5%以上
+GAPN_ENTRY_UP    =  5.0  # ギャップN: T+1が+5%以上
+GAPN_ENTRY_DOWN  = -5.0  # ギャップN: T+1が-5%以下
+BOTH_ENTRY_UP    =  5.0  # 両方一致: T+1が+5%以上
 
 JST = ZoneInfo("Asia/Tokyo")
 
-SHEET_SIGNALS = "シグナル履歴"
-SHEET_RUNLOG  = "配信ログ"
+SHEET_SIGNALS  = "シグナル履歴"
+SHEET_RUNLOG   = "配信ログ"
+SHEET_FOLLOWUP = "フォローアップ"
 
 HEADERS = [
     "シグナル日", "コード", "銘柄名", "シグナル種別",
@@ -51,11 +62,15 @@ HEADERS = [
     "期待値(5日)", "期待値(10日)", "期待値(20日)"
 ]
 
+FOLLOWUP_HEADERS = [
+    "シグナル日", "コード", "銘柄名", "シグナル種別",
+    "T日終値", "T+1値動%", "エントリー判定", "T+2推奨エントリー日", "Gemini分析"
+]
+
 RUNLOG_HEADERS = [
     "対象日", "実行日時", "新規シグナル数", "メール件名"
 ]
 
-# JPX取得失敗時のフォールバック（旧来の50銘柄）
 STOCKS_FALLBACK = {
     "7203": "トヨタ自動車",    "7267": "ホンダ",
     "7269": "スズキ",          "7270": "SUBARU",
@@ -124,40 +139,120 @@ def business_days_between(start_dt, end_dt) -> int:
 
 
 # ============================================================
-# Gemini API（下落要因分析）
+# エントリー条件判定
 # ============================================================
 
-def analyze_drop_reason(code: str, name: str, ret: float, gap: float, date_str: str) -> str:
-    """Gemini + Google検索で⭐銘柄の下落要因を分析する"""
+def check_entry_condition(signal_type: str, t1_ret: float) -> bool:
+    """T+1の値動きがエントリー条件を満たすか判定する"""
+    if "両方一致" in signal_type or "⭐" in signal_type:
+        return t1_ret >= BOTH_ENTRY_UP
+    elif "出来高C" in signal_type or "🔵" in signal_type:
+        return t1_ret >= VOLC_ENTRY_UP
+    elif "ギャップN" in signal_type or "🟠" in signal_type:
+        return t1_ret >= GAPN_ENTRY_UP or t1_ret <= GAPN_ENTRY_DOWN
+    return False
+
+
+def get_entry_reason(signal_type: str, t1_ret: float) -> str:
+    """エントリー条件を満たした理由を返す"""
+    if "ギャップN" in signal_type or "🟠" in signal_type:
+        if t1_ret <= GAPN_ENTRY_DOWN:
+            return f"T+1続落({t1_ret:+.1f}%) → 底値接近シグナル"
+        else:
+            return f"T+1反発({t1_ret:+.1f}%) → 悪材料出尽くし確認"
+    else:
+        return f"T+1大幅反発({t1_ret:+.1f}%) → 反転確認"
+
+
+def get_expected_return(signal_type: str) -> str:
+    """シグナル種別ごとの期待リターンを返す（T+2始値買い・5日後）"""
+    if "両方一致" in signal_type or "⭐" in signal_type:
+        return "5日後+9.8% / 勝率100%"
+    elif "出来高C" in signal_type or "🔵" in signal_type:
+        return "5日後+8.7% / 勝率94%"
+    elif "ギャップN" in signal_type or "🟠" in signal_type:
+        return "5日後+7.5〜8.2% / 勝率93〜95%"
+    return ""
+
+
+# ============================================================
+# かぶたんニュース取得
+# ============================================================
+
+def fetch_kabutan_news(code: str, name: str) -> str:
+    """かぶたんから直近ニュース見出しを取得する"""
+    try:
+        url = f"https://kabutan.jp/stock/news?code={code}"
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; StockBot/1.0)"}
+        resp = requests.get(url, timeout=10, headers=headers)
+
+        if resp.status_code != 200:
+            return f"ニュース取得失敗（HTTP {resp.status_code}）"
+
+        soup = BeautifulSoup(resp.content, "html.parser")
+
+        news_items = []
+
+        # 複数のセレクタを試す
+        for selector in [
+            "table.s-news-list td.s-news-title a",
+            ".news_list a",
+            "a[href*='/news/']",
+        ]:
+            items = soup.select(selector)
+            for item in items[:5]:
+                text = item.get_text(strip=True)
+                if text and len(text) > 5:
+                    news_items.append(text)
+            if news_items:
+                break
+
+        if not news_items:
+            return "直近ニュースなし"
+
+        return "\n".join(news_items[:5])
+
+    except Exception as e:
+        return f"ニュース取得エラー: {e}"
+
+
+# ============================================================
+# Gemini分析
+# ============================================================
+
+def analyze_with_gemini(code: str, name: str, signal_type: str,
+                         t1_ret: float, news_text: str, date_str: str) -> str:
+    """かぶたんニュースをもとにGeminiで下落要因を分析する"""
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         return "（GEMINI_API_KEY未設定）"
 
     try:
         from google import genai as gai
-        from google.genai.types import Tool, GenerateContentConfig, GoogleSearch
+        from google.genai.types import GenerateContentConfig
 
         client = gai.Client(api_key=api_key)
 
         prompt = (
-            f"{date_str}に{name}(コード{code})の株価が{ret:+.1f}%下落しました。"
-            f"最新ニュースをもとに日本語5行以内で教えてください。"
-            f"1. 下落の主な要因(1〜2文) "
-            f"2. 一時的か構造的か "
-            f"3. 逆張りの適性(高い/中程度/低い)と理由(1文)"
+            f"{date_str}に{name}(コード{code})の株価が急落し、"
+            f"翌日({t1_ret:+.1f}%)の値動きを経てエントリー条件を満たしました。\n\n"
+            f"直近のニュース:\n{news_text}\n\n"
+            f"上記をもとに日本語5行以内で教えてください:\n"
+            f"1. 下落の主な要因\n"
+            f"2. 一時的か構造的か\n"
+            f"3. 逆張り適性(高い/中程度/低い)と理由"
         )
+
         response = client.models.generate_content(
             model="gemini-2.0-flash-lite",
             contents=prompt,
-            config=GenerateContentConfig(
-                tools=[Tool(google_search=GoogleSearch())]
-            )
+            config=GenerateContentConfig(max_output_tokens=300)
         )
 
         return response.text.strip()
 
     except Exception as e:
-        return f"（分析エラー: {e}）"
+        return f"（分析エラー: {str(e)[:80]}）"
 
 
 # ============================================================
@@ -165,7 +260,6 @@ def analyze_drop_reason(code: str, name: str, ret: float, gap: float, date_str: 
 # ============================================================
 
 def fetch_prime_stocks() -> dict:
-    """JPXからプライム市場の全銘柄一覧を取得する"""
     url = (
         "https://www.jpx.co.jp/markets/statistics-equities"
         "/misc/tvdivq0000001vg2-att/data_j.xls"
@@ -190,19 +284,17 @@ def fetch_prime_stocks() -> dict:
         return stocks
 
     except Exception as e:
-        print(f"⚠️ プライム銘柄取得失敗: {e}")
-        print("   → フォールバック: 組み込み50銘柄を使用")
+        print(f"⚠️ プライム銘柄取得失敗: {e} → フォールバック50銘柄を使用")
         return STOCKS_FALLBACK
 
 
 def fetch_margin_ratios() -> dict:
-    """JPXから最新の信用倍率を取得する（コード → 倍率）"""
     today = datetime.now(JST).date()
 
     for weeks_back in range(4):
-        days_back  = (today.weekday() - 4) % 7 + weeks_back * 7
-        target     = today - timedelta(days=days_back)
-        date_str   = target.strftime("%Y%m%d")
+        days_back = (today.weekday() - 4) % 7 + weeks_back * 7
+        target    = today - timedelta(days=days_back)
+        date_str  = target.strftime("%Y%m%d")
         url = (
             "https://www.jpx.co.jp/markets/statistics-equities"
             f"/margin/nlsgeu000000xbna-att/data_{date_str}.csv"
@@ -213,11 +305,7 @@ def fetch_margin_ratios() -> dict:
             if resp.status_code != 200:
                 continue
 
-            df = pd.read_csv(
-                io.BytesIO(resp.content),
-                encoding="shift_jis",
-                skiprows=1,
-            )
+            df = pd.read_csv(io.BytesIO(resp.content), encoding="shift_jis", skiprows=1)
 
             code_cols  = [c for c in df.columns if "コード" in str(c)]
             ratio_cols = [c for c in df.columns if "倍率" in str(c)]
@@ -225,14 +313,11 @@ def fetch_margin_ratios() -> dict:
             if not code_cols or not ratio_cols:
                 continue
 
-            code_col  = code_cols[0]
-            ratio_col = ratio_cols[0]
-
             result = {}
             for _, row in df.iterrows():
                 try:
-                    code  = str(int(row[code_col])).zfill(4)
-                    ratio = float(row[ratio_col])
+                    code  = str(int(row[code_cols[0]])).zfill(4)
+                    ratio = float(row[ratio_cols[0]])
                     if ratio > 0:
                         result[code] = ratio
                 except Exception:
@@ -245,7 +330,7 @@ def fetch_margin_ratios() -> dict:
             print(f"  {date_str} 取得失敗: {e}")
             continue
 
-    print("⚠️ 信用倍率データ取得失敗 → 信用倍率フィルターなしで続行")
+    print("⚠️ 信用倍率データ取得失敗 → フィルターなしで続行")
     return {}
 
 
@@ -254,14 +339,12 @@ def fetch_margin_ratios() -> dict:
 # ============================================================
 
 def get_sheets_client():
-    raw = get_env("GOOGLE_SHEETS_CREDENTIALS")
+    raw        = get_env("GOOGLE_SHEETS_CREDENTIALS")
     creds_dict = json.loads(raw)
-
-    scopes = [
+    scopes     = [
         "https://www.googleapis.com/auth/spreadsheets",
         "https://www.googleapis.com/auth/drive",
     ]
-
     creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
     return gspread.authorize(creds)
 
@@ -318,11 +401,6 @@ def fetch_data(stocks: dict):
     if raw is None or raw.empty:
         raise RuntimeError("yfinanceから株価データを取得できませんでした")
 
-    required = ["Close", "Open", "Volume"]
-    for col in required:
-        if col not in raw.columns.get_level_values(0):
-            raise RuntimeError(f"yfinanceデータに {col} 列がありません")
-
     close  = raw["Close"].copy()
     open_  = raw["Open"].copy()
     volume = raw["Volume"].copy()
@@ -343,8 +421,7 @@ def calc_signals(close, open_, volume, stocks: dict):
     if valid_close.empty:
         raise RuntimeError("有効な終値データがありません")
 
-    latest = valid_close.index[-1]
-
+    latest    = valid_close.index[-1]
     avg_vol   = volume.shift(1).rolling(VOL_WINDOW, min_periods=VOL_WINDOW).mean()
     daily_ret = close.pct_change()
     vol_ratio = volume / avg_vol
@@ -356,20 +433,16 @@ def calc_signals(close, open_, volume, stocks: dict):
     def build_hits(signal_df):
         latest_signal = signal_df.loc[latest].fillna(False)
         hit_codes     = latest_signal[latest_signal].index.tolist()
-
         rows = []
         for code in hit_codes:
             if code not in close.columns:
                 continue
-
             price = close.loc[latest, code]
             if not is_valid_number(price):
                 continue
-
             ret_value = daily_ret.loc[latest, code] * 100
             gap_value = gap.loc[latest, code] * 100
             vol_value = vol_ratio.loc[latest, code]
-
             rows.append({
                 "code":      code,
                 "name":      stocks.get(code, code),
@@ -378,17 +451,167 @@ def calc_signals(close, open_, volume, stocks: dict):
                 "gap":       float(gap_value)  if is_valid_number(gap_value)  else 0.0,
                 "vol_ratio": float(vol_value)  if is_valid_number(vol_value)  else 0.0,
             })
-
         return rows
 
-    volC_hits = build_hits(sig_volC)
-    gapN_hits = build_hits(sig_gapN)
-
-    return latest, volC_hits, gapN_hits
+    return latest, build_hits(sig_volC), build_hits(sig_gapN)
 
 
 # ============================================================
-# 買いタイミングアドバイス
+# 処理①: フォローアップ（前日シグナルのT+1チェック）
+# ============================================================
+
+def process_followup(spreadsheet, close, latest_date, stocks: dict) -> list:
+    """
+    前日のシグナル銘柄のT+1値動きを確認し、
+    エントリー条件を満たした銘柄のリストを返す
+    """
+    # 前営業日を計算
+    t1_date  = pd.Timestamp(latest_date)
+    t_date   = t1_date - pd.offsets.BDay(1)
+    t_date_str = t_date.strftime("%Y/%m/%d")
+
+    print(f"📋 フォローアップ確認: シグナル日={t_date_str} / T+1日={t1_date.strftime('%Y/%m/%d')}")
+
+    # シグナル履歴から前日シグナルを読み取る
+    try:
+        ws       = spreadsheet.worksheet(SHEET_SIGNALS)
+        all_rows = ws.get_all_values()
+    except Exception as e:
+        print(f"  ⚠️ シグナル履歴読み取りエラー: {e}")
+        return []
+
+    yesterday_signals = []
+    for row in all_rows[1:]:
+        if len(row) < 5:
+            continue
+        if row[0] == t_date_str:
+            yesterday_signals.append({
+                "code":        row[1],
+                "name":        row[2],
+                "signal_type": row[3],
+                "t_close":     to_float(row[4]),
+            })
+
+    if not yesterday_signals:
+        print(f"  前日（{t_date_str}）のシグナルなし")
+        return []
+
+    print(f"  前日シグナル: {len(yesterday_signals)}件")
+
+    # T+1値動きを計算してエントリー条件判定
+    qualified = []
+    followup_rows = []
+
+    for sig in yesterday_signals:
+        code    = sig["code"]
+        t_close = sig["t_close"]
+
+        if t_close <= 0:
+            continue
+
+        if code not in close.columns:
+            continue
+
+        try:
+            t1_close = close.loc[t1_date, code]
+            if not is_valid_number(t1_close):
+                continue
+
+            t1_ret = (float(t1_close) / t_close - 1) * 100
+
+        except Exception:
+            continue
+
+        meets_condition = check_entry_condition(sig["signal_type"], t1_ret)
+        entry_judgment  = "✅エントリー推奨" if meets_condition else "⏭スキップ"
+        t2_entry_date   = next_business_day(t1_date)
+
+        followup_rows.append([
+            t_date_str,
+            code,
+            sig["name"],
+            sig["signal_type"],
+            round(t_close, 0),
+            round(t1_ret, 2),
+            entry_judgment,
+            t2_entry_date if meets_condition else "-",
+            "",  # Gemini分析は後で追記
+        ])
+
+        if meets_condition:
+            qualified.append({
+                "code":        code,
+                "name":        sig["name"],
+                "signal_type": sig["signal_type"],
+                "t_close":     t_close,
+                "t1_ret":      t1_ret,
+                "t2_entry":    t2_entry_date,
+                "reason":      get_entry_reason(sig["signal_type"], t1_ret),
+                "expected":    get_expected_return(sig["signal_type"]),
+                "t_date_str":  t_date_str,
+            })
+
+    print(f"  エントリー推奨: {len(qualified)}件 / スキップ: {len(yesterday_signals)-len(qualified)}件")
+
+    # フォローアップシートに記録
+    if followup_rows:
+        try:
+            ws_fu = get_or_create_sheet(spreadsheet, SHEET_FOLLOWUP, FOLLOWUP_HEADERS)
+            ws_fu.append_rows(followup_rows, value_input_option="RAW")
+        except Exception as e:
+            print(f"  ⚠️ フォローアップシート記録エラー: {e}")
+
+    return qualified
+
+
+# ============================================================
+# 処理①: フォローアップメール作成・送信
+# ============================================================
+
+def build_followup_email(qualified: list, t1_date_str: str, t2_date_str: str, signal_date_str: str) -> str:
+    lines = [
+        f"【エントリー推奨】{t2_date_str}（明日）寄り付きエントリー候補",
+        "",
+        f"シグナル日: {signal_date_str}",
+        f"T+1確認日: {t1_date_str}",
+        f"推奨エントリー: {t2_date_str} 寄り付き",
+        "",
+        f"条件を満たした銘柄: {len(qualified)}件",
+        "",
+    ]
+
+    for r in qualified:
+        lines += [
+            "━" * 27,
+            f"{r['signal_type']}",
+            "━" * 27,
+            f"  {r['code']} {r['name']}",
+            f"  T日終値    : ¥{r['t_close']:,.0f}",
+            f"  T+1値動き  : {r['t1_ret']:+.1f}%",
+            f"  判定理由   : {r['reason']}",
+            f"  期待リターン: {r['expected']}（過去検証ベース）",
+            "",
+        ]
+
+        if r.get("gemini"):
+            lines += [
+                "【AI下落要因分析】",
+                r["gemini"],
+                "",
+            ]
+
+    lines += [
+        "━" * 27,
+        "※ 過去検証上の傾向であり、将来の利益を保証するものではありません",
+        "※ ニュース・決算・地合いを確認したうえで判断してください",
+        "⚠️ 投資判断はご自身でお願いします",
+    ]
+
+    return "\n".join(lines)
+
+
+# ============================================================
+# 処理②: 当日シグナル（候補通知）
 # ============================================================
 
 def get_timing_advice(signal, ret_pct, vol_ratio, gap_pct):
@@ -398,68 +621,120 @@ def get_timing_advice(signal, ret_pct, vol_ratio, gap_pct):
 
     if signal == "volC":
         if ret <= -10:
-            strength = "強🔴"
-            e5, e10, e20 = "+1.0%", "+1.5%", "+1.9%"
-            entry = "翌営業日の寄り付き候補。ただしニュース・決算確認を優先"
-            point = "大きく下げているため、過去検証上は反発余地を確認する場面"
+            strength = "強🔴"; e5, e10, e20 = "+8.7%", "-", "-"
+            point = "大幅下落。T+1が+5%以上反発すれば翌日エントリー"
         elif ret <= -5:
-            strength = "中🟡"
-            e5, e10, e20 = "+1.0%", "+1.5%", "+1.9%"
-            entry = "翌営業日の寄り付き候補"
-            point = (
-                f"出来高{vol:.1f}x。過去検証上は短期反発が出やすい局面"
-                if vol > 0 else
-                "過去検証上は短期反発が出やすい局面"
-            )
+            strength = "中🟡"; e5, e10, e20 = "+8.7%", "-", "-"
+            point = f"出来高{vol:.1f}x。T+1の反発を確認してから判断"
         else:
-            strength = "弱🟢"
-            e5, e10, e20 = "+1.0%", "+1.5%", "+1.9%"
-            entry = "翌営業日の寄り付き候補。ただし優先度は低め"
-            point = "下落幅は比較的軽め。早めの利確も選択肢"
-
-        advice = (
-            f"  シグナル強度: {strength}\n"
-            f"  エントリー  : {entry}\n"
-            f"  期待リターン: 5日後{e5} / 10日後{e10} / 20日後{e20}\n"
-            f"  ポイント   : {point}"
-        )
+            strength = "弱🟢"; e5, e10, e20 = "+8.7%", "-", "-"
+            point = "T+1が+5%以上反発した場合のみエントリー検討"
 
     elif signal == "gapN":
         if gap <= -10:
-            strength = "強🔴"
-            e5, e10, e20 = "+1.0%", "+2.4%", "+4.3%"
-            entry = "翌営業日から候補。ただし1〜2日様子を見る選択肢もあり"
-            point = "大きなギャップダウン後の反発狙い。材料確認が重要"
+            strength = "強🔴"; e5, e10, e20 = "+7.5〜8.2%", "-", "-"
+            point = "大ギャップ。T+1が-5%以下続落 or +5%以上反発でエントリー"
         elif gap <= -7:
-            strength = "中🟡"
-            e5, e10, e20 = "+1.0%", "+2.4%", "+4.3%"
-            entry = "翌営業日の寄り付き候補"
-            point = "ギャップダウン後の反発狙い。地合いとニュース確認が重要"
+            strength = "中🟡"; e5, e10, e20 = "+7.5〜8.2%", "-", "-"
+            point = "T+1の値動きで判断。続落 or 大幅反発を待つ"
         else:
-            strength = "弱🟢"
-            e5, e10, e20 = "+1.0%", "+2.4%", "+4.3%"
-            entry = "翌営業日の寄り付き候補。ただし優先度は低め"
-            point = "出来高Cとの同時シグナルがあれば、より注目度が高い"
+            strength = "弱🟢"; e5, e10, e20 = "+7.5〜8.2%", "-", "-"
+            point = "T+1が-5%以下続落 or +5%以上反発でエントリー検討"
 
-        advice = (
-            f"  シグナル強度: {strength}\n"
-            f"  エントリー  : {entry}\n"
-            f"  期待リターン: 5日後{e5} / 10日後{e10} / 20日後{e20}\n"
-            f"  ポイント   : {point}"
-        )
+    else:  # both
+        strength = "最強⭐"; e5, e10, e20 = "+9.8%", "-", "-"
+        point = "T+1が+5%以上反発でエントリー"
 
-    else:  # both → ポイント行なし（Gemini分析に置き換え）
-        strength = "最強⭐"
-        e5, e10, e20 = "+2.0%", "+3.0%", "+4.3%"
-        entry = "翌営業日の寄り付き候補"
-
-        advice = (
-            f"  シグナル強度: {strength}\n"
-            f"  エントリー  : {entry}\n"
-            f"  期待リターン: 5日後{e5} / 10日後{e10} / 20日後{e20}"
-        )
+    advice = (
+        f"  シグナル強度: {strength}\n"
+        f"  T+2期待値  : {e5}（T+1条件達成時・過去検証ベース）\n"
+        f"  明日の判断 : {point}"
+    )
 
     return advice, e5, e10, e20
+
+
+def build_candidate_email(latest_date, volC_rows, gapN_rows):
+    """T日の候補通知メール"""
+    both_codes = {r["code"] for r in volC_rows} & {r["code"] for r in gapN_rows}
+    date_str   = latest_date.strftime("%Y年%m月%d日")
+    weekday    = ["月", "火", "水", "木", "金", "土", "日"][latest_date.weekday()]
+    t1_date    = pd.Timestamp(latest_date) + pd.offsets.BDay(1)
+    t1_str     = t1_date.strftime("%m月%d日")
+    t2_date    = pd.Timestamp(latest_date) + pd.offsets.BDay(2)
+    t2_str     = t2_date.strftime("%m月%d日")
+
+    total = len(set(r["code"] for r in volC_rows) | set(r["code"] for r in gapN_rows))
+
+    lines = [
+        f"【要注目候補】{date_str}（{weekday}）シグナル検知",
+        "",
+        f"明日（{t1_str}）の値動きを確認してください。",
+        f"条件を満たした銘柄は{t1_str}夕方に「エントリー推奨」メールでお知らせします。",
+        "",
+        f"本日の候補: {total}銘柄",
+        "",
+    ]
+
+    # ⭐ 両方一致
+    for r in volC_rows:
+        if r["code"] in both_codes:
+            lines += [
+                "━" * 27,
+                "⭐ 両方一致（最注目候補）",
+                "━" * 27,
+                (
+                    f"  {r['code']} {r['name']}  "
+                    f"¥{r['price']:,.0f}  "
+                    f"当日{r['ret']:+.1f}%  "
+                    f"gap{r['gap']:+.1f}%  "
+                    f"出来高{r['vol_ratio']:.1f}x"
+                ),
+                "",
+            ]
+            advice, _, _, _ = get_timing_advice("both", r["ret"], r["vol_ratio"], r["gap"])
+            lines += [advice, ""]
+
+    # 🔵 出来高C
+    for r in volC_rows:
+        if r["code"] not in both_codes:
+            lines += [
+                "━" * 27,
+                f"🔵 出来高C：{r['code']} {r['name']}",
+                "━" * 27,
+                (
+                    f"  ¥{r['price']:,.0f}  "
+                    f"当日{r['ret']:+.1f}%  "
+                    f"出来高{r['vol_ratio']:.1f}x"
+                ),
+                "",
+            ]
+            advice, _, _, _ = get_timing_advice("volC", r["ret"], r["vol_ratio"], r["gap"])
+            lines += [advice, ""]
+
+    # 🟠 ギャップN
+    for r in gapN_rows:
+        if r["code"] not in both_codes:
+            lines += [
+                "━" * 27,
+                f"🟠 ギャップN：{r['code']} {r['name']}",
+                "━" * 27,
+                f"  ¥{r['price']:,.0f}  gap{r['gap']:+.1f}%",
+                "",
+            ]
+            advice, _, _, _ = get_timing_advice("gapN", r["ret"], r["vol_ratio"], r["gap"])
+            lines += [advice, ""]
+
+    lines += [
+        "━" * 27,
+        f"エントリー推奨メール配信予定: {t1_str}（T+1確認後）",
+        "条件: T+1が+5%以上反発 / ギャップNは-5%以下続落も対象",
+        "",
+        "⚠️ 投資判断はご自身でお願いします",
+        "⚠️ 必ずニュース・決算を確認してから判断してください",
+    ]
+
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -479,48 +754,37 @@ def update_sheets(spreadsheet, latest_date, volC_rows, gapN_rows, close):
         for i, row in enumerate(all_rows[1:], start=2):
             if len(row) < 8:
                 continue
-
             existing_keys.add(f"{row[0]}_{row[1]}")
-
             status = row[10] if len(row) > 10 else ""
-
             if ("保有中" not in status) and ("期間終了" not in status):
                 continue
-
             code = row[1]
             if code not in close.columns:
                 continue
-
             try:
-                buy_price = to_float(row[4])
+                buy_price   = to_float(row[4])
                 if buy_price <= 0:
                     continue
-
                 current_raw = close.loc[latest_date, code]
                 if not is_valid_number(current_raw):
                     continue
-
                 current   = float(current_raw)
                 pnl_pct   = (current / buy_price - 1) * 100
                 sig_dt    = datetime.strptime(row[0], "%Y/%m/%d")
                 hold_days = business_days_between(sig_dt, latest_date)
-
-                sell_by    = row[6] if len(row) > 6 else ""
+                sell_by   = row[6] if len(row) > 6 else ""
                 new_status = "保有中📈" if pnl_pct >= 0 else "保有中📉"
-
                 try:
                     sell_by_dt = datetime.strptime(sell_by, "%Y/%m/%d").date()
                     if pd.Timestamp(latest_date).date() >= sell_by_dt:
                         new_status = "⏰期間終了（売却検討）"
                 except Exception:
                     pass
-
                 ws.update(
                     f"H{i}:K{i}",
                     [[round(current, 0), round(pnl_pct, 2), hold_days, new_status]]
                 )
                 updates_count += 1
-
             except Exception as e:
                 print(f"  行{i}更新エラー: {e}")
 
@@ -530,52 +794,34 @@ def update_sheets(spreadsheet, latest_date, volC_rows, gapN_rows, close):
         key = f"{date_str}_{r['code']}"
         if key in existing_keys:
             return
-
         if not is_valid_number(r.get("price")):
             return
 
         sig_key = "both" if r["code"] in both_codes else (
             "volC" if "出来高" in signal_type else "gapN"
         )
-
-        _, e5, e10, e20 = get_timing_advice(
-            sig_key,
-            r.get("ret"),
-            r.get("vol_ratio"),
-            r.get("gap"),
-        )
-
+        _, e5, e10, e20 = get_timing_advice(sig_key, r.get("ret"), r.get("vol_ratio"), r.get("gap"))
         price = float(r["price"])
 
         new_rows.append([
-            date_str,
-            r["code"],
-            r["name"],
-            signal_type,
+            date_str, r["code"], r["name"], signal_type,
             round(price, 0),
             next_business_day(latest_date),
             add_business_days(latest_date, HOLDING_DAYS),
-            round(price, 0),
-            0.0,
-            0,
-            "保有中📊",
-            e5,
-            e10,
-            e20,
+            round(price, 0), 0.0, 0, "保有中📊",
+            e5, e10, e20,
         ])
 
     for r in volC_rows:
         make_row(r, "⭐両方一致" if r["code"] in both_codes else "🔵出来高C")
-
     for r in gapN_rows:
         if r["code"] not in both_codes:
             make_row(r, "🟠ギャップN")
 
     if new_rows:
-        ws.append_rows(new_rows, value_input_option="USER_ENTERED")
+        ws.append_rows(new_rows, value_input_option="RAW")
 
     print(f"✅ Sheets: 既存{updates_count}件更新 / 新規{len(new_rows)}件追加")
-
     return {"updated": updates_count, "new": len(new_rows)}
 
 
@@ -587,173 +833,25 @@ def get_portfolio_summary(spreadsheet):
         return []
 
     positions = []
-
     for row in all_rows[1:]:
         if len(row) < 11:
             continue
-
         status = row[10]
-
         if "保有中" in status or "期間終了" in status:
             try:
                 positions.append({
-                    "code":    row[1],
-                    "name":    row[2],
-                    "signal":  row[3],
+                    "code":    row[1], "name": row[2],
                     "buy":     to_float(row[4]) if row[4] else 0.0,
                     "current": to_float(row[7]) if row[7] else 0.0,
                     "pnl":     to_float(row[8]) if row[8] else 0.0,
                     "days":    int(to_float(row[9])) if row[9] else 0,
                     "status":  status,
-                    "sell_by": row[6] if len(row) > 6 else "",
                 })
             except Exception:
                 continue
 
     positions.sort(key=lambda x: x["pnl"], reverse=True)
     return positions
-
-
-# ============================================================
-# メール作成
-# ============================================================
-
-def build_email(latest_date, volC_rows, gapN_rows, positions, gemini_analyses: dict):
-    both_codes = {r["code"] for r in volC_rows} & {r["code"] for r in gapN_rows}
-
-    date_str = latest_date.strftime("%Y年%m月%d日")
-    weekday  = ["月", "火", "水", "木", "金", "土", "日"][latest_date.weekday()]
-    hold_end = pd.Timestamp(add_business_days(latest_date, HOLDING_DAYS)).strftime("%m月%d日")
-
-    total = len(set(r["code"] for r in volC_rows) | set(r["code"] for r in gapN_rows))
-
-    lines = [
-        f"【株式シグナルレポート v4.1】{date_str}（{weekday}）",
-        "",
-    ]
-
-    if total == 0:
-        lines += ["本日はシグナルなし", ""]
-    else:
-        lines += [f"シグナル銘柄：合計 {total} 銘柄", ""]
-
-        # ⭐ 両方一致
-        for r in volC_rows:
-            if r["code"] in both_codes:
-                lines += [
-                    "━" * 27,
-                    "⭐ 両方一致（最注目シグナル）",
-                    "━" * 27,
-                    (
-                        f"  {r['code']} {r['name']}  "
-                        f"¥{r['price']:,.0f}  "
-                        f"当日{r['ret']:+.1f}%  "
-                        f"gap{r['gap']:+.1f}%  "
-                        f"出来高{r['vol_ratio']:.1f}x"
-                    ),
-                    "",
-                ]
-
-                advice, _, _, _ = get_timing_advice(
-                    "both", r["ret"], r["vol_ratio"], r["gap"]
-                )
-                lines += [advice, ""]
-
-                # Gemini分析
-                analysis = gemini_analyses.get(r["code"])
-                if analysis:
-                    lines += [
-                        "【AI下落要因分析】",
-                        analysis,
-                        "",
-                    ]
-
-        # 🔵 出来高C
-        for r in volC_rows:
-            if r["code"] not in both_codes:
-                lines += [
-                    "━" * 27,
-                    f"🔵 出来高C：{r['code']} {r['name']}",
-                    "━" * 27,
-                    (
-                        f"  ¥{r['price']:,.0f}  "
-                        f"当日{r['ret']:+.1f}%  "
-                        f"出来高{r['vol_ratio']:.1f}x"
-                    ),
-                    "",
-                ]
-                advice, _, _, _ = get_timing_advice(
-                    "volC", r["ret"], r["vol_ratio"], r["gap"]
-                )
-                lines += [advice, ""]
-
-        # 🟠 ギャップN
-        for r in gapN_rows:
-            if r["code"] not in both_codes:
-                lines += [
-                    "━" * 27,
-                    f"🟠 ギャップN：{r['code']} {r['name']}",
-                    "━" * 27,
-                    f"  ¥{r['price']:,.0f}  gap{r['gap']:+.1f}%",
-                    "",
-                ]
-                advice, _, _, _ = get_timing_advice(
-                    "gapN", r["ret"], r["vol_ratio"], r["gap"]
-                )
-                lines += [advice, ""]
-
-    # 保有ポジション損益表
-    if positions:
-        lines += [
-            "━" * 27,
-            "📊 保有ポジション損益表",
-            "━" * 27,
-        ]
-
-        lines.append(
-            f"  {'コード':<6} {'銘柄':<10} {'買値':>7} {'現在値':>7} {'損益':>7} {'日数':>4}"
-        )
-        lines.append("  " + "─" * 50)
-
-        total_pnl = 0.0
-        wins = 0
-
-        for p in positions:
-            emoji = "📈" if p["pnl"] >= 0 else "📉"
-            lines.append(
-                f"  {p['code']:<6} {p['name'][:9]:<10}"
-                f"  ¥{p['buy']:>6,.0f}  ¥{p['current']:>6,.0f}"
-                f"  {p['pnl']:>+6.1f}%  {p['days']:>3}日 {emoji}"
-            )
-            total_pnl += p["pnl"]
-            wins += 1 if p["pnl"] >= 0 else 0
-
-        avg      = total_pnl / len(positions)
-        win_rate = wins / len(positions) * 100
-
-        lines += [
-            "  " + "─" * 50,
-            f"  {len(positions)}件 | 平均損益: {avg:+.1f}% | 勝率: {win_rate:.0f}%",
-            "  ※ Google Sheetsで詳細確認できます",
-            "",
-        ]
-
-    # フッター
-    lines += [
-        "━" * 27,
-        "📋 分析ベース期待値（参考）",
-        "━" * 27,
-        "  出来高C : 5日後+1.0% / 10日後+1.5% / 20日後+1.9%",
-        "  ギャップN: 5日後+1.0% / 10日後+2.4% / 20日後+4.3%",
-        "  ※ 過去検証上の傾向であり、将来の利益を保証するものではありません",
-        "  ※ ニュース・決算・地合いを確認したうえで判断してください",
-        "",
-        f"推奨保有期間：{HOLDING_DAYS}営業日（〜{hold_end}）",
-        "⚠️ 投資判断はご自身でお願いします",
-        "⚠️ 必ずニュース・決算を5分確認してから判断してください",
-    ]
-
-    return "\n".join(lines)
 
 
 # ============================================================
@@ -769,7 +867,6 @@ def send_email(subject, body):
     msg["From"]    = gmail_user
     msg["To"]      = to_email
     msg["Subject"] = subject
-
     msg.attach(MIMEText(body, "plain", "utf-8"))
 
     with smtplib.SMTP("smtp.gmail.com", 587) as s:
@@ -794,19 +891,12 @@ def main():
     # 信用倍率フィルター
     print("📋 信用倍率データ取得中...")
     margin_ratios = fetch_margin_ratios()
-
     if margin_ratios:
-        excluded = {
-            code for code, ratio in margin_ratios.items()
-            if ratio > MAX_MARGIN_RATIO
-        }
-        stocks = {k: v for k, v in stocks.items() if k not in excluded}
-        print(
-            f"   信用倍率 > {MAX_MARGIN_RATIO} で除外: {len(excluded)}銘柄 "
-            f"/ 対象残り: {len(stocks)}銘柄"
-        )
+        excluded = {code for code, ratio in margin_ratios.items() if ratio > 5.0}
+        stocks   = {k: v for k, v in stocks.items() if k not in excluded}
+        print(f"   信用倍率フィルター: {len(excluded)}銘柄除外 / 残り{len(stocks)}銘柄")
 
-    # 株価データ取得・シグナル計算
+    # 株価データ取得
     print("📥 データ取得中...")
     close, open_, volume = fetch_data(stocks)
 
@@ -826,65 +916,83 @@ def main():
 
     date_str_mail  = latest.strftime("%Y年%m月%d日")
     date_str_sheet = latest.strftime("%Y/%m/%d")
+    t1_date        = pd.Timestamp(latest) + pd.offsets.BDay(1)
+    t2_date        = pd.Timestamp(latest) + pd.offsets.BDay(2)
 
     total = len(set(r["code"] for r in volC_rows) | set(r["code"] for r in gapN_rows))
+    print(f"   対象日：{date_str_mail} / 出来高C:{len(volC_rows)} / ギャップN:{len(gapN_rows)}")
 
-    print(
-        f"   対象日：{date_str_mail} / "
-        f"出来高C:{len(volC_rows)} / ギャップN:{len(gapN_rows)}"
-    )
-
-    # ⭐ 両方一致銘柄のGemini分析
-    both_codes = {r["code"] for r in volC_rows} & {r["code"] for r in gapN_rows}
-    gemini_analyses = {}
-
-    if both_codes and os.environ.get("GEMINI_API_KEY"):
-        print(f"🤖 Gemini分析中... ({len(both_codes)}銘柄)")
-        for r in volC_rows:
-            if r["code"] in both_codes:
-                print(f"   分析: {r['code']} {r['name']}")
-                gemini_analyses[r["code"]] = analyze_drop_reason(
-                    r["code"], r["name"], r["ret"], r["gap"], date_str_mail
-                )
-
-    # Google Sheets 更新
-    positions     = []
     spreadsheet   = None
     update_result = {"updated": 0, "new": 0}
-
-    print("📊 Google Sheets 更新中...")
+    qualified     = []
 
     try:
         gc          = get_sheets_client()
         spreadsheet = gc.open_by_key(get_env("SHEETS_ID"))
 
-        update_result = update_sheets(
-            spreadsheet,
-            latest,
-            volC_rows,
-            gapN_rows,
-            close,
-        )
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 処理①: フォローアップ（前日シグナルのT+1チェック）
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        print("\n🔍 処理①: フォローアップチェック...")
+        qualified = process_followup(spreadsheet, close, latest, stocks)
+
+        # Gemini分析（エントリー推奨銘柄のみ）
+        if qualified and os.environ.get("GEMINI_API_KEY"):
+            print(f"🤖 Gemini分析中... ({len(qualified)}銘柄)")
+            for r in qualified:
+                print(f"   {r['code']} {r['name']} のニュース取得中...")
+                news = fetch_kabutan_news(r["code"], r["name"])
+                r["gemini"] = analyze_with_gemini(
+                    r["code"], r["name"], r["signal_type"],
+                    r["t1_ret"], news, r["t_date_str"]
+                )
+
+        # フォローアップメール送信
+        if qualified:
+            followup_body    = build_followup_email(
+                qualified,
+                t1_date_str    = latest.strftime("%Y年%m月%d日"),
+                t2_date_str    = t2_date.strftime("%Y年%m月%d日"),
+                signal_date_str = (pd.Timestamp(latest) - pd.offsets.BDay(1)).strftime("%Y年%m月%d日")
+            )
+            followup_subject = (
+                f"【エントリー推奨】{t2_date.strftime('%m月%d日')}寄り付き "
+                f"/ {len(qualified)}銘柄"
+            )
+            print("\n📧 フォローアップメール送信中...")
+            send_email(followup_subject, followup_body)
+        else:
+            print("   エントリー推奨銘柄なし → フォローアップメールなし")
+
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        # 処理②: 当日シグナル（候補通知）
+        # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+        print("\n📊 処理②: 当日シグナル → Sheets更新...")
+        update_result = update_sheets(spreadsheet, latest, volC_rows, gapN_rows, close)
 
         positions = get_portfolio_summary(spreadsheet)
         print(f"   保有ポジション：{len(positions)} 件")
 
     except Exception as e:
-        print(f"⚠️ Sheets更新エラー（メール送信は継続）: {e}")
+        print(f"⚠️ Sheets処理エラー（メール送信は継続）: {e}")
 
-    body    = build_email(latest, volC_rows, gapN_rows, positions, gemini_analyses)
-    subject = f"【株式シグナル v4.1】{date_str_mail} / {total}銘柄"
+    # 候補通知メール送信
+    if total > 0:
+        candidate_body    = build_candidate_email(latest, volC_rows, gapN_rows)
+        candidate_subject = (
+            f"【要注目候補】{date_str_mail} / {total}銘柄 "
+            f"→ {t1_date.strftime('%m月%d日')}値動き確認"
+        )
+        print("\n📧 候補通知メール送信中...")
+        send_email(candidate_subject, candidate_body)
+    else:
+        print("本日はシグナルなし → 候補メールなし")
 
-    if positions:
-        avg      = sum(p["pnl"] for p in positions) / len(positions)
-        subject += f" | 保有{len(positions)}件 平均{avg:+.1f}%"
-
-    print("\n📧 メール送信中...")
-    send_email(subject, body)
-
+    # 配信ログ記録
     if spreadsheet is not None:
         try:
-            add_run_log(spreadsheet, date_str_sheet, update_result["new"], subject)
+            add_run_log(spreadsheet, date_str_sheet, update_result["new"],
+                        f"候補{total}件/推奨{len(qualified)}件")
             print("✅ 配信ログを記録しました")
         except Exception as e:
             print(f"⚠️ 配信ログ記録エラー: {e}")
