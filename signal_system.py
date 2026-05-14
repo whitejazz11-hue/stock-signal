@@ -595,7 +595,7 @@ def build_followup_email(qualified: list, t1_date_str: str, t2_date_str: str, si
 
         if r.get("gemini"):
             lines += [
-                "【AI下落要因分析】",
+                "【直近ニュース（かぶたん）】",
                 r["gemini"],
                 "",
             ]
@@ -937,15 +937,11 @@ def main():
         qualified = process_followup(spreadsheet, close, latest, stocks)
 
         # Gemini分析（エントリー推奨銘柄のみ）
-        if qualified and os.environ.get("GEMINI_API_KEY"):
-            print(f"🤖 Gemini分析中... ({len(qualified)}銘柄)")
+        if qualified:
+            print(f"📰 かぶたんニュース取得中... ({len(qualified)}銘柄)")
             for r in qualified:
-                print(f"   {r['code']} {r['name']} のニュース取得中...")
-                news = fetch_kabutan_news(r["code"], r["name"])
-                r["gemini"] = analyze_with_gemini(
-                    r["code"], r["name"], r["signal_type"],
-                    r["t1_ret"], news, r["t_date_str"]
-                )
+                print(f"   {r['code']} {r['name']}")
+                r["gemini"] = fetch_kabutan_news(r["code"], r["name"])
 
         # フォローアップメール送信
         if qualified:
