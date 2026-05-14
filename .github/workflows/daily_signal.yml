@@ -33,5 +33,4 @@ jobs:
           GEMINI_API_KEY:             ${{ secrets.GEMINI_API_KEY }}
           PYTHONUTF8: "1"             
         run: |
-          pip install yfinance pandas numpy gspread google-auth requests openpyxl xlrd google-genai
-          python signal_system.py
+          pip install yfinance pandas numpy gspread google-auth requests openpyxl xlrd google-genai beautifulsoup4
