@@ -34,3 +34,4 @@ jobs:
           PYTHONUTF8: "1"             
         run: |
           pip install yfinance pandas numpy gspread google-auth requests openpyxl xlrd google-genai beautifulsoup4
+          python signal_system.py
