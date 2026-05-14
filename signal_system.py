@@ -180,37 +180,36 @@ def get_expected_return(signal_type: str) -> str:
 # ============================================================
 
 def fetch_kabutan_news(code: str, name: str) -> str:
-    """かぶたんから直近ニュース見出しを取得する"""
+    """minkabuから銘柄固有の直近ニュースを取得する"""
     try:
-        url = f"https://kabutan.jp/stock/news?code={code}"
+        url     = f"https://minkabu.jp/stock/{code}/news"
         headers = {"User-Agent": "Mozilla/5.0 (compatible; StockBot/1.0)"}
-        resp = requests.get(url, timeout=10, headers=headers)
+        resp    = requests.get(url, timeout=10, headers=headers)
 
         if resp.status_code != 200:
             return f"ニュース取得失敗（HTTP {resp.status_code}）"
 
-        soup = BeautifulSoup(resp.content, "html.parser")
+        soup  = BeautifulSoup(resp.content, "html.parser")
+        items = []
 
-        news_items = []
-
-        # 複数のセレクタを試す
         for selector in [
-            "table.s-news-list td.s-news-title a",
-            ".news_list a",
-            "a[href*='/news/']",
+            "a.news_item_title",
+            ".md_newslist a",
+            "li.md_newsFeed_item a",
+            ".ly_content_wrapper a[href*='/news/']",
         ]:
-            items = soup.select(selector)
-            for item in items[:5]:
-                text = item.get_text(strip=True)
-                if text and len(text) > 5:
-                    news_items.append(text)
-            if news_items:
+            found = soup.select(selector)
+            for el in found[:5]:
+                text = el.get_text(strip=True)
+                if text and len(text) > 10:
+                    items.append(text)
+            if items:
                 break
 
-        if not news_items:
-            return "直近ニュースなし"
+        if not items:
+            return f"{name}の直近ニュースなし"
 
-        return "\n".join(news_items[:5])
+        return "\n".join(f"・{t}" for t in items[:4])
 
     except Exception as e:
         return f"ニュース取得エラー: {e}"
