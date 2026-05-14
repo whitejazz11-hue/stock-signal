@@ -244,7 +244,7 @@ def analyze_with_gemini(code: str, name: str, signal_type: str,
         )
 
         response = client.models.generate_content(
-            model="gemini-2.0-flash-lite",
+            model="gemini-1.5-flash-8b",
             contents=prompt,
             config=GenerateContentConfig(max_output_tokens=300)
         )
