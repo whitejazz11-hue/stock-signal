@@ -180,11 +180,15 @@ def get_expected_return(signal_type: str) -> str:
 # ============================================================
 
 def fetch_kabutan_news(code: str, name: str) -> str:
-    """minkabuから銘柄固有の直近ニュースを取得する"""
+    """Yahoo ファイナンスから銘柄固有のニュースを取得する"""
     try:
-        url     = f"https://minkabu.jp/stock/{code}/news"
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; StockBot/1.0)"}
-        resp    = requests.get(url, timeout=10, headers=headers)
+        url = f"https://finance.yahoo.co.jp/quote/{code}.T/news"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/120.0.0.0 Safari/537.36"
+        }
+        resp = requests.get(url, timeout=10, headers=headers)
 
         if resp.status_code != 200:
             return f"ニュース取得失敗（HTTP {resp.status_code}）"
@@ -193,18 +197,20 @@ def fetch_kabutan_news(code: str, name: str) -> str:
         items = []
 
         for selector in [
-            "a.news_item_title",
-            ".md_newslist a",
-            "li.md_newsFeed_item a",
-            ".ly_content_wrapper a[href*='/news/']",
+            "a[href*='/news/detail/']",
+            ".newsItem a",
+            "li a[data-cl-params]",
+            "ul li a",
         ]:
             found = soup.select(selector)
-            for el in found[:5]:
+            for el in found[:6]:
                 text = el.get_text(strip=True)
-                if text and len(text) > 10:
+                if text and len(text) > 10 and len(text) < 100:
                     items.append(text)
             if items:
                 break
+
+        items = list(dict.fromkeys(items))  # 重複除去
 
         if not items:
             return f"{name}の直近ニュースなし"
