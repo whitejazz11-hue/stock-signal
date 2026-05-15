@@ -154,14 +154,13 @@ def check_entry_condition(signal_type: str, t1_ret: float) -> bool:
 
 
 def get_entry_reason(signal_type: str, t1_ret: float) -> str:
-    """エントリー条件を満たした理由を返す"""
     if "ギャップN" in signal_type or "🟠" in signal_type:
         if t1_ret <= GAPN_ENTRY_DOWN:
-            return f"T+1続落({t1_ret:+.1f}%) → 底値接近シグナル"
+            return f"翌日続落({t1_ret:+.1f}%) → 底値接近シグナル"
         else:
-            return f"T+1反発({t1_ret:+.1f}%) → 悪材料出尽くし確認"
+            return f"翌日反発({t1_ret:+.1f}%) → 悪材料出尽くし確認"
     else:
-        return f"T+1大幅反発({t1_ret:+.1f}%) → 反転確認"
+        return f"翌日大幅反発({t1_ret:+.1f}%) → 反転確認"
 
 
 def get_expected_return(signal_type: str) -> str:
@@ -180,37 +179,34 @@ def get_expected_return(signal_type: str) -> str:
 # ============================================================
 
 def fetch_kabutan_news(code: str, name: str) -> str:
-    """かぶたんから直近ニュース見出しを取得する"""
+    """Google ニュースRSSから銘柄関連ニュースを取得する"""
     try:
-        url = f"https://kabutan.jp/stock/news?code={code}"
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; StockBot/1.0)"}
-        resp = requests.get(url, timeout=10, headers=headers)
+        import xml.etree.ElementTree as ET
+        from urllib.parse import quote
+
+        query = quote(f"{name} {code}")
+        url   = (
+            f"https://news.google.com/rss/search"
+            f"?q={query}&hl=ja&gl=JP&ceid=JP:ja"
+        )
+        headers = {"User-Agent": "Mozilla/5.0"}
+        resp    = requests.get(url, timeout=10, headers=headers)
 
         if resp.status_code != 200:
             return f"ニュース取得失敗（HTTP {resp.status_code}）"
 
-        soup = BeautifulSoup(resp.content, "html.parser")
+        root  = ET.fromstring(resp.content)
+        items = []
 
-        news_items = []
+        for item in root.findall(".//item")[:5]:
+            title = item.findtext("title")
+            if title and len(title) > 5:
+                items.append(title.strip())
 
-        # 複数のセレクタを試す
-        for selector in [
-            "table.s-news-list td.s-news-title a",
-            ".news_list a",
-            "a[href*='/news/']",
-        ]:
-            items = soup.select(selector)
-            for item in items[:5]:
-                text = item.get_text(strip=True)
-                if text and len(text) > 5:
-                    news_items.append(text)
-            if news_items:
-                break
+        if not items:
+            return f"{name}の直近ニュースなし"
 
-        if not news_items:
-            return "直近ニュースなし"
-
-        return "\n".join(news_items[:5])
+        return "\n".join(f"・{t}" for t in items[:4])
 
     except Exception as e:
         return f"ニュース取得エラー: {e}"
