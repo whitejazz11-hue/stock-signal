@@ -1002,6 +1002,10 @@ def main():
         print("\n🔍 処理①: フォローアップチェック...")
         qualified = process_followup(spreadsheet, close, latest, stocks)
 
+        # T+2始値の後付け記録（本日エントリー予定だった銘柄）
+        print("\n📌 T+2始値記録チェック...")
+        update_t2_entry_prices(spreadsheet, open_, latest)
+
         # Gemini分析（エントリー推奨銘柄のみ）
         if qualified:
             print(f"📰 関連ニュース取得中... ({len(qualified)}銘柄)")
