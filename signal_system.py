@@ -329,7 +329,77 @@ def fetch_margin_ratios() -> dict:
     print("⚠️ 信用倍率データ取得失敗 → フィルターなしで続行")
     return {}
 
+# ============================================================
+# 処理①-補足: T+2始値を買値列に後付け記録
+# ============================================================
 
+def update_t2_entry_prices(spreadsheet, open_, latest_date):
+    """
+    T+2日の実行時に、本日エントリー推奨だった銘柄のT+2始値を
+    シグナル履歴の「買値」列(E列)に上書き記録する
+    """
+    today_str = pd.Timestamp(latest_date).strftime("%Y/%m/%d")
+    print(f"  T+2始値記録チェック: エントリー予定日={today_str}")
+
+    # フォローアップシートから「T+2推奨エントリー日 == 今日 かつ ✅」の行を抽出
+    # FOLLOWUP_HEADERS インデックス: 0=シグナル日, 1=コード, 6=エントリー判定, 7=T+2推奨エントリー日
+    try:
+        ws_fu   = spreadsheet.worksheet(SHEET_FOLLOWUP)
+        fu_rows = ws_fu.get_all_values()
+    except Exception as e:
+        print(f"  ⚠️ フォローアップシート読み取りエラー: {e}")
+        return
+
+    target = {}  # {code: signal_date_str}
+    for row in fu_rows[1:]:
+        if len(row) < 8:
+            continue
+        if row[7] == today_str and "✅" in row[6]:
+            target[row[1]] = row[0]  # code -> シグナル日
+
+    if not target:
+        print(f"  T+2始値記録対象なし")
+        return
+
+    print(f"  T+2始値記録対象: {len(target)}件 → {list(target.keys())}")
+
+    # シグナル履歴の対象行を探してE列（買値）を更新
+    # HEADERS インデックス: 0=シグナル日, 1=コード, 4=買値, 8=損益(%)
+    try:
+        ws_sig   = spreadsheet.worksheet(SHEET_SIGNALS)
+        sig_rows = ws_sig.get_all_values()
+    except Exception as e:
+        print(f"  ⚠️ シグナル履歴読み取りエラー: {e}")
+        return
+
+    updated = 0
+    for i, row in enumerate(sig_rows[1:], start=2):
+        if len(row) < 5:
+            continue
+        code        = row[1]
+        signal_date = row[0]
+
+        if code not in target or target[code] != signal_date:
+            continue
+
+        try:
+            t2_open = open_.loc[latest_date, code]
+            if not is_valid_number(t2_open):
+                print(f"    {code}: T+2始値データなし（スキップ）")
+                continue
+
+            t2_open_val = round(float(t2_open), 0)
+            old_val     = row[4]
+
+            # E列（買値）を上書き
+            ws_sig.update(f"E{i}", [[t2_open_val]])
+            print(f"    ✅ {code}: 買値 {old_val} → {t2_open_val}（T+2始値）")
+            updated += 1
+
+        except Exception as e:
+            print(f"    {code} 更新エラー: {e}")
+
+    print(f"  T+2始値記録完了: {updated}件")
 # ============================================================
 # Google Sheets 接続
 # ============================================================
