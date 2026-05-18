@@ -626,7 +626,7 @@ def process_followup(spreadsheet, close, latest_date, stocks: dict) -> list:
             ws_fu.append_rows(followup_rows, value_input_option="RAW")
         except Exception as e:
             print(f"  ⚠️ フォローアップシート記録エラー: {e}")
-　　 # 買いサイン銘柄のみシグナル履歴に追加
+    # 買いサイン銘柄のみシグナル履歴に追加
     if qualified:
         try:
             ws_sig     = get_or_create_sheet(spreadsheet, SHEET_SIGNALS, HEADERS)
