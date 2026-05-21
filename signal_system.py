@@ -626,52 +626,35 @@ def process_followup(spreadsheet, close, latest_date, stocks: dict) -> list:
             ws_fu.append_rows(followup_rows, value_input_option="RAW")
         except Exception as e:
             print(f"  ⚠️ フォローアップシート記録エラー: {e}")
-    # 買いサイン銘柄のみシグナル履歴に追加
-    if qualified:
+
+    # ⏭スキップ銘柄をシグナル履歴から削除（買いサインのみ残す）
+    qualified_codes = {r["code"] for r in qualified}
+    skip_codes = {
+        sig["code"] for sig in yesterday_signals
+        if sig["code"] not in qualified_codes
+    }
+
+    if skip_codes:
         try:
-            ws_sig     = get_or_create_sheet(spreadsheet, SHEET_SIGNALS, HEADERS)
-            sig_rows   = ws_sig.get_all_values()
-            existing_keys = {
-                f"{row[0]}_{row[1]}"
-                for row in sig_rows[1:]
-                if len(row) >= 2
-            }
+            ws_sig   = get_or_create_sheet(spreadsheet, SHEET_SIGNALS, HEADERS)
+            sig_rows = ws_sig.get_all_values()
 
-            new_signal_rows = []
-            for r in qualified:
-                key = f"{r['t_date_str']}_{r['code']}"
-                if key in existing_keys:
+            rows_to_delete = []
+            for i, row in enumerate(sig_rows[1:], start=2):
+                if len(row) < 2:
                     continue
+                if row[0] == t_date_str and row[1] in skip_codes:
+                    rows_to_delete.append(i)
 
-                signal_type = r["signal_type"]
-                if "両方一致" in signal_type or "⭐" in signal_type:
-                    e5, e10, e20 = "+9.8%", "-", "-"
-                elif "出来高C" in signal_type or "🔵" in signal_type:
-                    e5, e10, e20 = "+8.7%", "-", "-"
-                else:
-                    e5, e10, e20 = "+7.5〜8.2%", "-", "-"
+            # 後ろから削除（行番号のズレを防ぐ）
+            for idx in sorted(rows_to_delete, reverse=True):
+                ws_sig.delete_rows(idx)
 
-                new_signal_rows.append([
-                    r["t_date_str"],
-                    r["code"],
-                    r["name"],
-                    signal_type,
-                    round(r["t_close"], 0),                        # 仮の買値（T+2始値で上書き）
-                    r["t2_entry"],                                  # エントリー推奨日
-                    add_business_days(r["t_date_str"], HOLDING_DAYS),  # 推奨売却日
-                    round(r["t_close"], 0),                        # 現在値（仮）
-                    0.0, 0, "保有中📊",
-                    e5, e10, e20,
-                ])
-
-            if new_signal_rows:
-                ws_sig.append_rows(new_signal_rows, value_input_option="RAW")
-                print(f"  ✅ シグナル履歴に{len(new_signal_rows)}件追加（買いサインのみ）")
+            print(f"  🗑️ スキップ銘柄を削除: {len(rows_to_delete)}件")
 
         except Exception as e:
-            print(f"  ⚠️ シグナル履歴追加エラー: {e}")
+            print(f"  ⚠️ スキップ銘柄削除エラー: {e}")
 
-    return qualified
     return qualified
 
 
@@ -901,8 +884,41 @@ def update_sheets(spreadsheet, latest_date, volC_rows, gapN_rows, close):
 
    
 
-    print(f"✅ Sheets: 既存{updates_count}件更新")
-    return {"updated": updates_count, "new": 0}
+    new_rows = []
+
+    def make_row(r, signal_type):
+        key = f"{date_str}_{r['code']}"
+        if key in existing_keys:
+            return
+        if not is_valid_number(r.get("price")):
+            return
+
+        sig_key = "both" if r["code"] in both_codes else (
+            "volC" if "出来高" in signal_type else "gapN"
+        )
+        _, e5, e10, e20 = get_timing_advice(sig_key, r.get("ret"), r.get("vol_ratio"), r.get("gap"))
+        price = float(r["price"])
+
+        new_rows.append([
+            date_str, r["code"], r["name"], signal_type,
+            round(price, 0),
+            next_business_day(latest_date),
+            add_business_days(latest_date, HOLDING_DAYS),
+            round(price, 0), 0.0, 0, "保有中📊",
+            e5, e10, e20,
+        ])
+
+    for r in volC_rows:
+        make_row(r, "⭐両方一致" if r["code"] in both_codes else "🔵出来高C")
+    for r in gapN_rows:
+        if r["code"] not in both_codes:
+            make_row(r, "🟠ギャップN")
+
+    if new_rows:
+        ws.append_rows(new_rows, value_input_option="RAW")
+
+    print(f"✅ Sheets: 既存{updates_count}件更新 / 新規{len(new_rows)}件追加")
+    return {"updated": updates_count, "new": len(new_rows)}
 
 
 def get_portfolio_summary(spreadsheet):
