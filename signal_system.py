@@ -1082,7 +1082,14 @@ def main():
         print("\n📧 候補通知メール送信中...")
         send_email(candidate_subject, candidate_body)
     else:
-        print("本日はシグナルなし → 候補メールなし")
+        print("本日はシグナルなし → 死活確認メール送信")
+        send_email(
+            f"【シグナルなし】{date_str_mail} システム正常稼働",
+            f"本日（{date_str_mail}）は逆張りシグナルが検出されませんでした。\n\n"
+            f"出来高C: 0件 / ギャップN: 0件\n\n"
+            f"システムは正常に稼働しています。\n"
+            f"次回実行: {t1_date.strftime('%m月%d日')} 16時頃"
+        )
 
     # 配信ログ記録
     if spreadsheet is not None:
