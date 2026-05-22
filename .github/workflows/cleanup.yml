@@ -1,0 +1,24 @@
+name: Cleanup Signal History
+
+on:
+  workflow_dispatch:  # 手動実行のみ
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install yfinance pandas numpy gspread google-auth requests openpyxl
+
+      - name: Run cleanup
+        env:
+          GOOGLE_SHEETS_CREDENTIALS: ${{ secrets.GOOGLE_SHEETS_CREDENTIALS }}
+          SHEETS_ID: ${{ secrets.SHEETS_ID }}
+        run: python cleanup_and_fix.py
