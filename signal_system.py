@@ -372,7 +372,8 @@ def update_t2_entry_prices(spreadsheet, open_, latest_date):
         print(f"  ⚠️ シグナル履歴読み取りエラー: {e}")
         return
 
-    updated = 0
+    updated    = 0
+    batch_data = []  # 一括書き込み用（APIクォータ対策）
     for i, row in enumerate(sig_rows[1:], start=2):
         if len(row) < 5:
             continue
@@ -391,13 +392,23 @@ def update_t2_entry_prices(spreadsheet, open_, latest_date):
             t2_open_val = round(float(t2_open), 0)
             old_val     = row[4]
 
-            # E列（買値）を上書き
-            ws_sig.update(f"E{i}", [[t2_open_val]])
+            # E列（買値）を一括更新リストに追加
+            batch_data.append({
+                "range": f"E{i}",
+                "values": [[t2_open_val]],
+            })
             print(f"    ✅ {code}: 買値 {old_val} → {t2_open_val}（T+2始値）")
             updated += 1
 
         except Exception as e:
             print(f"    {code} 更新エラー: {e}")
+
+    if batch_data:
+        try:
+            ws_sig.batch_update(batch_data, value_input_option="RAW")
+        except Exception as e:
+            print(f"  ⚠️ T+2始値一括更新エラー: {e}")
+            updated = 0
 
     print(f"  T+2始値記録完了: {updated}件")
 # ============================================================
@@ -526,10 +537,10 @@ def calc_signals(close, open_, volume, stocks: dict):
 # 処理①: フォローアップ（前日シグナルのT+1チェック）
 # ============================================================
 
-def process_followup(spreadsheet, close, latest_date, stocks: dict) -> list:
+def process_followup(spreadsheet, close, latest_date, stocks: dict):
     """
     前日のシグナル銘柄のT+1値動きを確認し、
-    エントリー条件を満たした銘柄のリストを返す
+    (エントリー条件を満たした銘柄リスト, 全候補のT+1結果リスト) を返す
     """
     # 前営業日を計算
     t1_date  = pd.Timestamp(latest_date)
@@ -544,7 +555,7 @@ def process_followup(spreadsheet, close, latest_date, stocks: dict) -> list:
         all_rows = ws.get_all_values()
     except Exception as e:
         print(f"  ⚠️ シグナル履歴読み取りエラー: {e}")
-        return []
+        return [], []
 
     yesterday_signals = []
     for row in all_rows[1:]:
@@ -560,12 +571,13 @@ def process_followup(spreadsheet, close, latest_date, stocks: dict) -> list:
 
     if not yesterday_signals:
         print(f"  前日（{t_date_str}）のシグナルなし")
-        return []
+        return [], []
 
     print(f"  前日シグナル: {len(yesterday_signals)}件")
 
     # T+1値動きを計算してエントリー条件判定
-    qualified = []
+    qualified  = []
+    t1_results = []  # 全候補のT+1結果（結果報告メール用）
     followup_rows = []
 
     for sig in yesterday_signals:
@@ -591,6 +603,16 @@ def process_followup(spreadsheet, close, latest_date, stocks: dict) -> list:
         meets_condition = check_entry_condition(sig["signal_type"], t1_ret)
         entry_judgment  = "✅エントリー推奨" if meets_condition else "⏭スキップ"
         t2_entry_date   = next_business_day(t1_date)
+
+        t1_results.append({
+            "code":        code,
+            "name":        sig["name"],
+            "signal_type": sig["signal_type"],
+            "t_close":     t_close,
+            "t1_close":    float(t1_close),
+            "t1_ret":      t1_ret,
+            "judgment":    entry_judgment,
+        })
 
         followup_rows.append([
             t_date_str,
@@ -646,16 +668,76 @@ def process_followup(spreadsheet, close, latest_date, stocks: dict) -> list:
                 if row[0] == t_date_str and row[1] in skip_codes:
                     rows_to_delete.append(i)
 
-            # 後ろから削除（行番号のズレを防ぐ）
+            # 後ろから削除（行番号のズレを防ぐ）。1回のAPIコールにまとめる（クォータ対策）
+            delete_requests = []
             for idx in sorted(rows_to_delete, reverse=True):
-                ws_sig.delete_rows(idx)
+                delete_requests.append({
+                    "deleteDimension": {
+                        "range": {
+                            "sheetId":    ws_sig.id,
+                            "dimension":  "ROWS",
+                            "startIndex": idx - 1,
+                            "endIndex":   idx,
+                        }
+                    }
+                })
+            if delete_requests:
+                spreadsheet.batch_update({"requests": delete_requests})
 
             print(f"  🗑️ スキップ銘柄を削除: {len(rows_to_delete)}件")
 
         except Exception as e:
             print(f"  ⚠️ スキップ銘柄削除エラー: {e}")
 
-    return qualified
+    return qualified, t1_results
+
+
+# ============================================================
+# 処理①-補足: 前日候補の結果報告メール（買いサインなしの日）
+# ============================================================
+
+def build_t1_result_email(t1_results: list, signal_date_str: str, t1_date_str: str) -> str:
+    """買いサインが出なかった日に、前日候補のT+1値動きを報告するメール本文"""
+    lines = [
+        f"【結果報告】{signal_date_str}の候補銘柄 → 買いサインなし",
+        "",
+        f"シグナル検知日  : {signal_date_str}",
+        f"翌日確認日      : {t1_date_str}",
+        "",
+    ]
+
+    if not t1_results:
+        lines += [
+            "前日の候補銘柄はありませんでした。",
+            "",
+            "システムは正常に稼働しています。",
+        ]
+        return "\n".join(lines)
+
+    lines += [
+        f"候補{len(t1_results)}銘柄を確認しましたが、",
+        "いずれもエントリー条件（+5%以上反発 / ギャップNは-5%以下続落も対象）を満たしませんでした。",
+        "",
+        "── 各銘柄の翌日値動き ──",
+        "",
+    ]
+
+    # 値動きの大きい順に表示
+    sorted_results = sorted(t1_results, key=lambda x: x["t1_ret"], reverse=True)
+
+    for r in sorted_results:
+        lines.append(
+            f"  {r['signal_type']} {r['code']} {r['name']}\n"
+            f"    終値 ¥{r['t_close']:,.0f} → ¥{r['t1_close']:,.0f}（{r['t1_ret']:+.1f}%）"
+        )
+        lines.append("")
+
+    lines += [
+        "━" * 27,
+        "エントリー推奨はありません。これらの銘柄の追跡は終了します。",
+    ]
+
+    return "\n".join(lines)
 
 
 # ============================================================
@@ -843,6 +925,7 @@ def update_sheets(spreadsheet, latest_date, volC_rows, gapN_rows, close):
 
     existing_keys = set()
     updates_count = 0
+    batch_data    = []  # 一括書き込み用（APIクォータ対策）
 
     if len(all_rows) > 1:
         for i, row in enumerate(all_rows[1:], start=2):
@@ -874,13 +957,21 @@ def update_sheets(spreadsheet, latest_date, volC_rows, gapN_rows, close):
                         new_status = "⏰期間終了（売却検討）"
                 except Exception:
                     pass
-                ws.update(
-                    f"H{i}:K{i}",
-                    [[round(current, 0), round(pnl_pct, 2), hold_days, new_status]]
-                )
+                batch_data.append({
+                    "range": f"H{i}:K{i}",
+                    "values": [[round(current, 0), round(pnl_pct, 2), hold_days, new_status]],
+                })
                 updates_count += 1
             except Exception as e:
                 print(f"  行{i}更新エラー: {e}")
+
+    # まとめて1回のAPIコールで書き込む（1行ずつだとクォータ超過するため）
+    if batch_data:
+        try:
+            ws.batch_update(batch_data, value_input_option="RAW")
+        except Exception as e:
+            print(f"  ⚠️ 一括更新エラー: {e}")
+            updates_count = 0
 
    
 
@@ -1021,6 +1112,7 @@ def main():
     spreadsheet   = None
     update_result = {"updated": 0, "new": 0}
     qualified     = []
+    t1_results    = []
 
     try:
         gc          = get_sheets_client()
@@ -1030,7 +1122,7 @@ def main():
         # 処理①: フォローアップ（前日シグナルのT+1チェック）
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         print("\n🔍 処理①: フォローアップチェック...")
-        qualified = process_followup(spreadsheet, close, latest, stocks)
+        qualified, t1_results = process_followup(spreadsheet, close, latest, stocks)
 
         # T+2始値の後付け記録（本日エントリー予定だった銘柄）
         print("\n📌 T+2始値記録チェック...")
@@ -1058,7 +1150,22 @@ def main():
             print("\n📧 買いサインメール送信中...")
             send_email(followup_subject, followup_body)
         else:
-            print("   買いサイン銘柄なし → メールなし")
+            # 買いサインなし → 前日候補の結果報告メールを送信
+            signal_date_str = (pd.Timestamp(latest) - pd.offsets.BDay(1)).strftime("%Y年%m月%d日")
+            result_body = build_t1_result_email(
+                t1_results,
+                signal_date_str = signal_date_str,
+                t1_date_str     = latest.strftime("%Y年%m月%d日"),
+            )
+            if t1_results:
+                result_subject = (
+                    f"【結果報告】{signal_date_str}候補{len(t1_results)}銘柄 "
+                    f"/ 買いサインなし"
+                )
+            else:
+                result_subject = f"【結果報告】{signal_date_str} 前日候補なし"
+            print("\n📧 結果報告メール送信中...")
+            send_email(result_subject, result_body)
 
         # ━━━━━━━━━━━━━━━━━━━━━━━━━━━━
         # 処理②: 当日シグナル（候補通知）
